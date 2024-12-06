@@ -1,0 +1,740 @@
+---
+title: "SOEP Data Preparation"
+author: "Salma-Anastasiia-Suzanna"
+date: "2024-12-04"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+# Introduction
+
+This report documents the steps taken to preprocess and analyze the SOEP data for health-related outcomes, subjective and objective health measures, and control variables. The transformations include cleaning, imputing missing values, and deriving new variables.
+
+------------------------------------------------------------------------
+
+# 1. Setup
+
+## 1.1 Load Required Packages
+
+```{r}
+# Load required packages
+my_packages <- c("tidyverse", "haven", "openxlsx", "labelled", "dplyr", "lubridate")
+
+for (p in my_packages) {
+  if (!require(p, character.only = TRUE)) {
+    install.packages(p, dependencies = TRUE)
+  }
+  library(p, character.only = TRUE)
+}
+```
+
+## 1.2 Load the pl Dataset
+
+```{r}
+main <- read_dta('/Users/salmahoumane/Documents/R/pl.dta') %>%
+  select(
+    "pid", "syear", "ple0008", "plh0035", "ple0055", "ple0056", "ple0072", "ple0081_h", "ple0086_v4",
+    "ple0080_v2", "ple0086_v1", "ple0086_v4", paste0("ple00", 11:23),
+    "ple0004", "ple0005", "ple0095", "plh0182", "plh0171",
+    "plh0042", "plh0033", "plh0032", "ple0010_h", "ple0006", "ple0007"
+  )
+```
+
+## 1.3 Merge with Other Datasets
+
+```{r}
+# Merge with `pgen` dataset
+data_pgen <- read_dta('/Users/salmahoumane/Documents/R/pgen.dta') %>%
+  select("pid", "syear", "pgerwzeit", "pgemplst", "pglabnet", "pgtatzeit", "pgexpue", "pgstib")
+main <- merge(main, data_pgen, by = c("pid", "syear"), all.x = TRUE)
+
+# Merge with `ppathl` dataset
+data_ppathl <- read_dta('/Users/salmahoumane/Documents/R/ppathl.dta') %>%
+  select("pid", "hid", "syear", "psample", "gebjahr", "sex", "migback", "germborn")
+main <- left_join(main, data_ppathl, by = c("pid", "syear"))
+```
+
+## 1.4 Main filtering: Analysis post 1999
+
+```{r}
+# Drop observations prior to 1999
+main <- main %>%
+  filter(syear >= 1999)
+```
+
+# 2. Outcome Variables
+
+## 2.1 Health
+
+```{r}
+# Clean and rename the `health` variable
+main <- main %>%
+  rename(health = ple0008) %>%
+  filter(health > -1)
+```
+
+## 2.2 Worries About Health
+
+```{r}
+# Create `worr_health_categorical` and `worr_health_dummy`
+main <- main %>%
+  rename(worr_health_categorical = plh0035) %>%
+  mutate(
+    worr_health_categorical = case_when(
+      worr_health_categorical < 0 ~ NA_real_,
+      TRUE ~ worr_health_categorical
+    )
+  ) %>%
+  group_by(pid) %>%
+  mutate(
+    worr_health_categorical = if_else(
+      syear %in% c(2011, 2012, 2013) & is.na(worr_health_categorical),
+      mean(
+        worr_health_categorical[syear %in% c(2010, 2014)],
+        na.rm = TRUE
+      ),
+      worr_health_categorical
+    )
+  ) %>%
+  ungroup() %>%
+  drop_na(worr_health_categorical) %>%
+  mutate(
+    worr_health_categorical = factor(
+      worr_health_categorical, levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_health_dummy = if_else(
+      worr_health_categorical %in% c("worries a lot", "worries a little"), 1, 0
+    )
+  ) 
+```
+
+## 2.3 Health Trends
+
+```{r}
+# Calculate past health and health differences
+main <- main %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
+  mutate(
+    past_health = lag(health, order_by = syear),
+    health_diff = health - past_health
+  ) %>%
+  ungroup()
+
+# Create health decline dummy for 2 years into the future
+main <- main %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
+  mutate(
+    health_in_2yrs = lead(health, n = 2, order_by = syear),
+    health_decline_2yrs = case_when(
+      !is.na(health_in_2yrs) & health_in_2yrs < health ~ 1,
+      !is.na(health_in_2yrs) & health_in_2yrs >= health ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup()
+```
+
+# 3. Measurement of health
+
+## 3.1 Objective Health
+
+## 3.1.1 Grip Strength
+
+```{r}
+# Process grip strength data and merge with main
+gripstr <- read_dta("/Users/salmahoumane/Documents/R/gripstr.dta") %>%
+  select(pid, syear, gs01, gs03, gs04, gs05, gs06) %>%
+  rename(
+    gripr1 = gs03, gripr2 = gs04,
+    gripl1 = gs05, gripl2 = gs06
+  ) %>%
+  filter(gs01 %in% c(1, 2, 3)) %>%
+  mutate(across(starts_with("grip"), ~ ifelse(. < 0, NA_real_, .))) %>%
+  mutate(
+    avg_gripr = rowMeans(cbind(gripr1, gripr2), na.rm = TRUE),
+    avg_gripl = rowMeans(cbind(gripl1, gripl2), na.rm = TRUE),
+    avg_grip = case_when(
+      gs01 == 1 ~ avg_gripr,
+      gs01 == 2 ~ avg_gripl,
+      gs01 == 3 ~ rowMeans(cbind(avg_gripr, avg_gripl), na.rm = TRUE),
+      TRUE ~ NA_real_
+    )
+  )
+
+main <- main %>%
+  left_join(gripstr, by = c("pid", "syear"))
+```
+
+## 3.1.2 BMI
+
+```{r}
+# Process height and weight
+main <- main %>%
+  mutate(
+    # Rename and handle outliers
+    height = case_when(
+      ple0006 > 245 ~ NA_real_,  # Outliers above 245 cm are set to NA
+      ple0006 > 0 ~ ple0006,     # Valid values
+      ple0006 <= 0 ~ NA_real_,   # Ensure all non-positive values are set to NA
+      TRUE ~ NA_real_            # Other invalid values to NA
+    )
+  ) %>%
+  group_by(pid) %>%
+  mutate(
+    # Impute missing `height` using the first non-NA value within the same `pid`
+    height = if_else(
+      is.na(height),
+      first(na.omit(height), default = NA_real_),  # Use first valid value or keep NA if none exist
+      height
+    )
+  ) %>%
+  ungroup() %>%
+  drop_na(height) %>%  # Drop rows where `height` remains NA
+  select(-ple0006)  # Drop the original `ple0006` column
+
+main <- main %>%
+  mutate(
+    # Rename and handle outliers
+    weight = case_when(
+      ple0007 > 220 ~ NA_real_,  # Outliers above 220 kg are set to NA
+      ple0007 > 0 ~ ple0007,     # Valid values
+      TRUE ~ NA_real_            # Other invalid values to NA
+    )
+  ) %>%
+  group_by(pid) %>%
+  mutate(
+    # Impute missing `weight` using average of previous and next years if both are non-NA
+    weight = if_else(
+      is.na(weight) & !is.na(lag(weight, order_by = syear)) & !is.na(lead(weight, order_by = syear)),
+      (lag(weight, order_by = syear) + lead(weight, order_by = syear)) / 2,
+      weight
+    )
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(weight)) %>%  # Drop rows where `weight` remains NA
+  select(-ple0007)  # Drop the original `ple0007` column
+
+#Create BMI using height and weight and BMI categories 
+main <- main %>%
+  mutate(
+    BMI = weight / ((height / 100) ^ 2)  # Convert height to meters and calculate BMI
+  )
+
+# Create BMI categorical variable
+main <- main %>%
+  mutate(
+    bmi_categorical = case_when(
+      BMI < 18.5 ~ "Underweight",
+      BMI >= 18.5 & BMI < 25 ~ "Normal weight",
+      BMI >= 25 & BMI < 30 ~ "Overweight",
+      BMI >= 30 ~ "Obese",
+      TRUE ~ NA_character_  # Catch any unexpected cases
+    )
+  ) %>%
+  mutate(
+    bmi_categorical = factor(
+      bmi_categorical,
+      levels = c("Underweight", "Normal weight", "Overweight", "Obese")
+    )
+  )
+```
+
+## 3.2 Subjective Health
+
+## 3.2.1 Life Satisfaction and Health Satisfaction
+
+```{r}
+# Create life_satisfaction and health_satisfaction variables
+main <- main %>%
+  filter(plh0182 >= 0 & plh0182 <= 10) %>%
+  mutate(
+    life_satisfaction = plh0182,
+    life_satisfaction_dummy = ifelse(plh0182 >= 5, 1, 0)
+  ) %>%
+  filter(plh0171 >= 0 & plh0171 <= 10) %>%
+  mutate(
+    health_satisfaction = plh0171,
+    health_satisfaction_dummy = ifelse(plh0171 >= 5, 1, 0)
+  )
+```
+
+## 3.2.2 Worries about job security, financial situation, and economic situation
+
+```{r}
+# Create variables for worries about job security, financial situation, and economic situation
+main <- main %>%
+  mutate(
+    worr_job_categorical = case_when(
+      plh0042 == -2 ~ 3,
+      plh0042 < 0 ~ NA_real_,
+      TRUE ~ plh0042
+    ),
+    worr_financial_categorical = case_when(
+      plh0033 == -2 ~ 3,
+      plh0033 < 0 ~ NA_real_,
+      TRUE ~ plh0033
+    ),
+    worr_economic_categorical = case_when(
+      plh0032 == -2 ~ 3,
+      plh0032 < 0 ~ NA_real_,
+      TRUE ~ plh0032
+    )
+  ) %>%
+  drop_na(worr_job_categorical, worr_financial_categorical, worr_economic_categorical) %>%
+  mutate(
+    worr_job_categorical = factor(
+      worr_job_categorical,
+      levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_financial_categorical = factor(
+      worr_financial_categorical,
+      levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_economic_categorical = factor(
+      worr_economic_categorical,
+      levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_job_dummy = ifelse(worr_job_categorical %in% c("worries a lot", "worries a little"), 1, 0),
+    worr_financial_dummy = ifelse(worr_financial_categorical %in% c("worries a lot", "worries a little"), 1, 0),
+    worr_economic_dummy = ifelse(worr_economic_categorical %in% c("worries a lot", "worries a little"), 1, 0)
+  ) %>%
+  select(-plh0042, -plh0033, -plh0032)
+```
+
+# 4. Control Variables
+
+## 4.1 Hospital Stay
+
+```{r}
+# Create `hospital_stay` variable
+main <- main %>%
+  mutate(
+    # Handle ple0055 transformations
+    ple0055 = case_when(
+      ple0055 < -2 ~ NA_real_,  # Transform values below -2 to NA
+      ple0055 == -2 ~ 0,        # Transform -2 to 0
+      ple0055 == -1 & 
+        !is.na(lag(ple0055, order_by = syear)) & 
+        !is.na(lead(ple0055, order_by = syear)) ~ 
+        (lag(ple0055, order_by = syear) + lead(ple0055, order_by = syear)) / 2,  # Impute missing values
+      ple0055 >= 0 ~ ple0055,   # Keep valid non-negative values
+      TRUE ~ NA_real_           # Set all other cases to NA
+    ),
+    # Handle ple0056 transformations
+    ple0056 = case_when(
+      ple0056 < -2 ~ NA_real_,  # Transform values below -2 to NA
+      ple0056 == -2 ~ 0,        # Transform -2 to 0
+      ple0056 == -1 & 
+        !is.na(lag(ple0056, order_by = syear)) & 
+        !is.na(lead(ple0056, order_by = syear)) ~ 
+        (lag(ple0056, order_by = syear) + lead(ple0056, order_by = syear)) / 2,  # Impute missing values
+      ple0056 >= 0 ~ ple0056,   # Keep valid non-negative values
+      TRUE ~ NA_real_           # Set all other cases to NA
+    )
+  ) %>%
+  # Drop rows where either ple0055 or ple0056 is NA
+  filter(!is.na(ple0055) & !is.na(ple0056)) %>%
+  # Ensure both ple0055 and ple0056 are non-negative before calculation
+  mutate(
+    ple0055 = if_else(ple0055 < 0, NA_real_, ple0055),
+    ple0056 = if_else(ple0056 < 0, NA_real_, ple0056),
+    hospital_stay = ple0055 + ple0056  # Calculate hospital stay
+  ) %>%
+  # Drop rows with negative hospital_stay
+  filter(hospital_stay >= 0) %>%
+  # Drop original columns
+  select(-ple0055, -ple0056)
+```
+
+## 4.2 Smoking and Number of Cigarettes
+
+```{r}
+# Create `smoking_dummy`
+main <- main %>%
+  # Transform ple0081_h
+  mutate(
+    ple0081_h = case_when(
+      ple0081_h == -2 ~ 2,  # Treat -2 as "no" (2)
+      ple0081_h > 0 ~ ple0081_h,  # Keep valid values (1 = yes, 2 = no)
+      TRUE ~ NA_real_  # Set all other cases to NA
+    )
+  ) %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by individual and year
+  group_by(pid) %>%
+  mutate(
+    # Impute missing values (-1) using the value from 2 years ago
+    ple0081_h = if_else(
+      is.na(ple0081_h) & lag(ple0081_h, 2) > 0,
+      lag(ple0081_h, 2),
+      ple0081_h
+    ),
+    # Impute missing values for intermediate years with the previous year's value
+    ple0081_h = if_else(
+      is.na(ple0081_h),
+      lag(ple0081_h),
+      ple0081_h
+    )
+  ) %>%
+  ungroup() %>%
+  # Drop rows where ple0081_h remains NA
+  filter(!is.na(ple0081_h)) %>%
+  # Create smoking_dummy
+  mutate(
+    smoking_dummy = if_else(ple0081_h == 1, 1, 0)  # 1 for yes, 0 for no
+  )
+# Creating number of cigarettes
+main <- main %>%
+  mutate(
+    # Handle ple0086_v4 values
+    ple0086_v4 = case_when(
+      ple0086_v4 == -2 ~ 0,  # Treat -2 as 0
+      ple0086_v4 >= 0 ~ ple0086_v4,  # Keep valid values
+      TRUE ~ NA_real_  # Set invalid values (e.g., -1) to NA for further imputation
+    )
+  ) %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by individual and year
+  group_by(pid) %>%
+  mutate(
+    # Copy 2002 values to earlier years, only if 2002 value exists
+    ple0086_v4 = case_when(
+      syear %in% c(1999, 2000, 2001, 2003) & is.na(ple0086_v4) &
+        any(syear == 2002 & !is.na(ple0086_v4)) ~ first(ple0086_v4[syear == 2002]),
+      TRUE ~ ple0086_v4
+    ),
+    # Copy even-year values to the following odd year, if available
+    ple0086_v4 = case_when(
+      syear %% 2 == 1 & is.na(ple0086_v4) &
+        !is.na(lag(ple0086_v4, order_by = syear)) ~ lag(ple0086_v4, order_by = syear),
+      TRUE ~ ple0086_v4
+    ),
+    # Impute remaining NA using the value from 2 years ago
+    ple0086_v4 = case_when(
+      is.na(ple0086_v4) & lag(ple0086_v4, 2, order_by = syear) > 0 ~ lag(ple0086_v4, 2, order_by = syear),
+      TRUE ~ ple0086_v4
+    )
+  ) %>%
+  ungroup() %>%
+  # Drop rows where ple0086_v4 remains NA
+  filter(!is.na(ple0086_v4)) %>%
+  # Create nb_of_cigarettes
+  mutate(nb_of_cigarettes = ple0086_v4)
+```
+
+## 4.3 Impairement Variables
+
+```{r}
+# Create impaired_stairs and impaired_tiring_tasks
+main <- main %>%
+  mutate(
+    # Handle ple0004 transformations
+    ple0004 = ifelse(ple0004 < -2, NA_real_, ple0004),
+    ple0004 = ifelse(
+      ple0004 == -1 & !is.na(lag(ple0004, order_by = syear)) & !is.na(lead(ple0004, order_by = syear)),
+      (lag(ple0004, order_by = syear) + lead(ple0004, order_by = syear)) / 2, ple0004
+    ),
+    ple0004 = ifelse(is.na(ple0004), 3, ple0004),  # Default unresolved NA to 3 ("no impairment")
+    
+    # Handle ple0005 transformations
+    ple0005 = ifelse(ple0005 < -2, NA_real_, ple0005),
+    ple0005 = ifelse(
+      ple0005 == -1 & !is.na(lag(ple0005, order_by = syear)) & !is.na(lead(ple0005, order_by = syear)),
+      (lag(ple0005, order_by = syear) + lead(ple0005, order_by = syear)) / 2, ple0005
+    ),
+    ple0005 = ifelse(is.na(ple0005), 3, ple0005)  # Default unresolved NA to 3 ("no impairment")
+  ) %>%
+  mutate(
+    # Calculate impaired_stairs
+    impaired_stairs = case_when(
+      ple0004 %in% c(1, 2) ~ 1,  # Impaired
+      ple0004 == 3 ~ 0        # Not impaired
+    ),
+    
+    # Calculate impaired_tiring_tasks
+    impaired_tiring_tasks = case_when(
+      ple0005 %in% c(1, 2) ~ 1,  # Impaired
+      ple0005 == 3 ~ 0         # Not impaired
+    )
+  ) %>%
+  # Drop rows where BOTH ple0004 and ple0005 are NA
+  filter(!is.na(impaired_tiring_tasks) & !is.na(impaired_stairs))
+```
+
+## 4.4 Tenure and Employment Status
+
+```{r}
+# Transform tenure (pgerwzeit) and employment status (pgemplst)
+main <- main %>%
+  mutate(
+    tenure = case_when(
+      pgerwzeit == -2 ~ 0,
+      pgerwzeit < 0 ~ NA_real_,
+      TRUE ~ pgerwzeit
+    ),
+    employment_status_categorical = case_when(
+      pgemplst == -2 ~ 5,
+      pgemplst == 1 ~ 1,
+      pgemplst == 2 ~ 2,
+      pgemplst == 3 ~ 3,
+      pgemplst == 4 ~ 4,
+      pgemplst == 5 ~ 5,
+      pgemplst == 6 ~ 6,
+      TRUE ~ NA_real_
+    ),
+    employed_dummy = ifelse(employment_status_categorical %in% c(1, 2), 1, 0)
+  ) %>%
+  drop_na(employment_status_categorical) %>%  # Remove rows with invalid values
+  drop_na(tenure) %>%  # Remove rows with NA values in tenure
+  mutate(
+    employment_status_categorical = factor(
+      employment_status_categorical,
+      levels = 1:6,
+      labels = c(
+        "Full-time", 
+        "Part-time", 
+        "Vocational training", 
+        "Irregular part-time", 
+        "Unemployed", 
+        "Sheltered workshop"
+      )
+    )
+  ) %>%
+  select(-pgemplst)  # Drop the original `pgemplst` column
+```
+
+## 4.5 Net Income
+
+```{r}
+# Transform `pglabnet` into `net_income`
+main <- main %>%
+  mutate(
+    net_income = case_when(
+      pglabnet == 99999 ~ NA_real_, # Treat `99999` as missing
+      pglabnet == -2 ~ 0,  # Set net income to 0 for "do not apply"
+      pglabnet < 0 ~ NA_real_,  # Drop all other negative values by setting them to NA
+      TRUE ~ pglabnet  # Keep valid values as is
+    )
+  ) %>%
+  drop_na(net_income) %>%  # Remove rows with NA values in net_income
+  select(-pglabnet)  # Drop the original `pglabnet` column
+# Transform `pgtatzeit` into `work_time_weekly`
+main <- main %>%
+  mutate(
+    work_time_weekly = case_when(
+      pgtatzeit == -2 ~ 0,  # Set work time to 0 for "do not apply"
+      pgtatzeit < 0 ~ NA_real_,  # Drop all other negative values by setting them to NA
+      TRUE ~ pgtatzeit  # Keep valid values as is
+    )
+  ) %>%
+  drop_na(work_time_weekly) %>%  # Remove rows with NA values in work_time_weekly
+  select(-pgtatzeit)  # Drop the original `pgtatzeit` column
+
+```
+
+## 4.6 Unemployment
+
+```{r}
+# Transform total years unemployed (pgexpue)
+main <- main %>%
+  mutate(
+    total_years_unemployment = case_when(
+      pgexpue == -2 ~ 0,
+      pgexpue < 0 ~ NA_real_,
+      TRUE ~ pgexpue
+    )
+  ) %>%
+  drop_na(total_years_unemployment) %>%
+  select(-pgexpue)
+```
+
+## 4.7 Occupational Status
+
+```{r}
+# Transform occupational status (pgstib)
+main <- main %>%
+  mutate(
+    occup_status = case_when(
+      between(pgstib, 210, 250) ~ 1,  # Blue collars
+      between(pgstib, 510, 550) ~ 2,  # White collars
+      between(pgstib, 610, 640) | pgstib == 15 ~ 3,  # Public servant
+      between(pgstib, 410, 440) ~ 4,  # Self-employed
+      pgstib == 12 ~ 5,  # Unemployed
+      pgstib == 10 ~ 6,  # Non-working
+      between(pgstib, 110, 150) | pgstib %in% c(11, 13) ~ 7,  # Apprentice, retired
+      TRUE ~ 8  # Assign a default category for unmatched values
+    )
+  ) %>%
+  # Drop the original `pgstib` column
+  select(-pgstib)
+
+# Add labels to `occup_status`, including the new "other" category
+occup_status_labels <- c(
+  "1" = "blue collar",
+  "2" = "white collar",
+  "3" = "public servant",
+  "4" = "self-employed",
+  "5" = "unemployed",
+  "6" = "non-working",
+  "7" = "apprentice, retired",
+  "8" = "other"
+)
+
+main$occup_status <- factor(main$occup_status, levels = 1:8, labels = occup_status_labels)
+```
+
+## 4.8 Gender
+
+```{r}
+# Transform sex into male dummy
+main <- main %>%
+  mutate(
+    male = case_when(
+      sex == 1 ~ 1,
+      sex == 2 ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  group_by(pid) %>%
+  mutate(male = if_else(is.na(male), first(na.omit(male)), male)) %>%
+  ungroup() %>%
+  drop_na(male) %>%
+  select(-sex)
+
+```
+
+## 4.8 Migration Background
+
+```{r}
+# Transform migration background and create dummy
+main <- main %>%
+  mutate(
+    migback = case_when(
+      migback == -2 ~ 1,
+      migback < 0 ~ NA_real_,
+      TRUE ~ migback
+    )
+  ) %>%
+  group_by(pid) %>%
+  mutate(migback = if_else(is.na(migback), first(na.omit(migback)), migback)) %>%
+  ungroup() %>%
+  drop_na(migback) %>%
+  mutate(
+    migback = factor(
+      migback,
+      levels = c(1, 2, 3),
+      labels = c("no migration", "direct migration", "indirect migration")
+    ),
+    migback_dummy = ifelse(migback %in% c("direct migration", "indirect migration"), 1, 0)
+  )
+```
+
+## 4.9 Born In Germany
+
+```{r}
+main <- main %>%
+  mutate(
+    germborn = case_when(
+      germborn == 2 ~ 0,
+      germborn < 0 ~ NA_real_,
+      TRUE ~ germborn
+    )
+  ) %>%
+  group_by(pid) %>%
+  mutate(germborn = if_else(is.na(germborn), first(na.omit(germborn)), germborn)) %>%
+  ungroup() %>%
+  drop_na(germborn)
+```
+
+## 4.10 Age: Filtering for age between 25 and 55
+
+```{r}
+# Create age and filter age range
+main <- main %>%
+  mutate(age = syear - ple0010_h) %>%
+  filter(!is.na(ple0010_h) & ple0010_h > 0) %>%
+  filter(age >= 25 & age <= 55) %>%
+  select(-ple0010_h)
+```
+
+# Special Potential Specifications
+
+## 1. Illnesses
+
+```{r}
+# Create illnesses variable
+illness_vars <- c("ple0011", "ple0012", "ple0013", "ple0014", "ple0015", 
+                  "ple0016", "ple0017", "ple0018", "ple0019", "ple0020", 
+                  "ple0021", "ple0022", "ple0023")
+
+main <- main %>%
+  mutate(across(
+    all_of(illness_vars),
+    ~ case_when(
+      . == -2 ~ 0,
+      . < -2 ~ NA_real_,
+      . == -1 ~ NA_real_,
+      TRUE ~ .
+    )
+  )) %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
+  mutate(across(
+    all_of(illness_vars),
+    ~ if_else(is.na(.), lag(., order_by = syear), .)
+  )) %>%
+  mutate(across(
+    all_of(illness_vars),
+    ~ if_else(is.na(.), lead(., order_by = syear), .)
+  )) %>%
+  ungroup() %>%
+  mutate(illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE))
+```
+
+## 2. Diet
+
+```{r}
+# Create diet_healthy and diet_dummy
+main <- main %>%
+  mutate(
+    ple0095 = ifelse(ple0095 < 0, NA_real_, ple0095),
+    diet_categorical = factor(
+      ple0095, levels = c(1, 2, 3, 4),
+      labels = c("very healthy", "somewhat healthy", "somewhat unhealthy", "very unhealthy")
+    ),
+    diet_dummy = case_when(
+      ple0095 %in% c(1, 2) ~ 1,
+      ple0095 %in% c(3, 4) ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(-ple0095)
+```
+
+# Final Cleanup: Keeping relevant variables
+
+```{r}
+# Select only the relevant variables
+main <- main %>%
+  select(
+    pid, syear, health, worr_health_categorical, worr_health_dummy, 
+    migback, germborn, hospital_stay, smoking_dummy, nb_of_cigarettes, illnesses, 
+    impaired_stairs, impaired_tiring_tasks, diet_categorical, diet_dummy, avg_grip, 
+    life_satisfaction, life_satisfaction_dummy, health_satisfaction, health_satisfaction_dummy, 
+    height, weight, BMI, bmi_categorical, worr_job_categorical, worr_financial_categorical,
+    worr_economic_categorical, worr_job_dummy, worr_financial_dummy, worr_economic_dummy, 
+    tenure, employment_status_categorical, employed_dummy, net_income, work_time_weekly,
+    total_years_unemployment, occup_status, male, migback_dummy, age
+  )
+
+#Display the summary of the dataset
+summary(main)
+```
