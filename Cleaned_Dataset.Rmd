@@ -12,7 +12,7 @@ output:
 ---
 # Introduction
 
-This report documents the steps taken to preprocess and analyze the SOEP data for health-related outcomes, subjective and objective health measures, and control variables. The transformations include cleaning, imputing missing values, and deriving new variables.
+This report documents the steps taken to preprocess and analyze the SOEP data for health-related outcomes: subjective and objective health measures, predictors, and control variables. The transformations include cleaning, imputing missing values, and deriving new variables.
 
 ------------------------------------------------------------------------
 
@@ -22,7 +22,7 @@ This report documents the steps taken to preprocess and analyze the SOEP data fo
 
 ```{r}
 # Load required packages
-my_packages <- c("tidyverse", "haven", "openxlsx", "labelled", "dplyr", "lubridate")
+my_packages <- c("tidyverse", "haven", "openxlsx", "labelled", "dplyr", "lubridate","ggplot2")
 
 for (p in my_packages) {
   if (!require(p, character.only = TRUE)) {
@@ -66,7 +66,7 @@ main <- main %>%
   filter(syear >= 1999)
 ```
 
-# 2. Outcome Variables
+# 2. Outcome Variables: Subjective Health
 
 ## 2.1 Health
 
@@ -75,6 +75,15 @@ main <- main %>%
 main <- main %>%
   rename(health = ple0008) %>%
   filter(health > -1)
+# Visualisation: Bar plot
+ggplot(main, aes(x = factor(health))) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Distribution of Self-Assessed Health",
+    x = "Health Category (1 = Excellent, 5 = Poor)",
+    y = "Count"
+  ) +
+  theme_minimal()
 ```
 
 ## 2.2 Worries About Health
@@ -110,7 +119,35 @@ main <- main %>%
     worr_health_dummy = if_else(
       worr_health_categorical %in% c("worries a lot", "worries a little"), 1, 0
     )
-  ) 
+  ) %>%
+  # Drop any rows with NA in worr_health_categorical
+  drop_na(worr_health_categorical)
+# Visualisation: Bar plot (categorical)
+ggplot(main, aes(x = worr_health_categorical)) +
+  geom_bar(fill = "coral") +
+  labs(
+    title = "Distribution of Worries About Health",
+    x = "Worries About Health",
+    y = "Count"
+  ) +
+  theme_minimal()
+# Visualisation: Pie Char (dummy)
+main %>%
+  group_by(worr_health_dummy) %>%
+  summarize(count = n()) %>%
+  mutate(
+    proportion = count / sum(count),
+    label = paste0(round(proportion * 100, 1), "%")
+  ) %>%
+  ggplot(aes(x = "", y = proportion, fill = factor(worr_health_dummy))) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  labs(
+    title = "Proportion of Health Worry (Dummy)",
+    fill = "Health Worry (Dummy)"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5))
 ```
 
 ## 2.3 Health Trends
@@ -139,13 +176,25 @@ main <- main %>%
     )
   ) %>%
   ungroup()
+#Visualisation: Line plot
+# Line plot: Average health over years
+main %>%
+  group_by(syear) %>%
+  summarize(avg_health = mean(health, na.rm = TRUE)) %>%
+  ggplot(aes(x = syear, y = avg_health)) +
+  geom_line(color = "darkgreen") +
+  geom_point(color = "darkgreen") +
+  labs(
+    title = "Average Self-Assessed Health Over Years",
+    x = "Survey Year",
+    y = "Average Health"
+  ) +
+  theme_minimal()
 ```
 
-# 3. Measurement of health
+# 3. Outcome Variables: Objective Health
 
-## 3.1 Objective Health
-
-## 3.1.1 Grip Strength
+## 3.1 Grip Strength
 
 ```{r}
 # Process grip strength data and merge with main
@@ -170,10 +219,206 @@ gripstr <- read_dta("/Users/salmahoumane/Documents/R/gripstr.dta") %>%
 
 main <- main %>%
   left_join(gripstr, by = c("pid", "syear"))
+
+# Visualisation: Histogram 
+ggplot(main, aes(x = avg_grip)) +
+  geom_histogram(binwidth = 20, fill = "steelblue", color = "black", alpha = 0.7) +
+  labs(
+    title = "Distribution of Average Grip Strength",
+    x = "Average Grip Strength",
+    y = "Count"
+  ) +
+  theme_minimal()
 ```
 
-## 3.1.2 BMI
+## 3.2 Hospital Stay
+```{r}
+# Create `hospital_stay` variable
+main <- main %>%
+  mutate(
+    # Handle ple0055 transformations
+    ple0055 = case_when(
+      ple0055 < -2 ~ NA_real_,  # Transform values below -2 to NA
+      ple0055 == -2 ~ 0,        # Transform -2 to 0
+      ple0055 == -1 & 
+        !is.na(lag(ple0055, order_by = syear)) & 
+        !is.na(lead(ple0055, order_by = syear)) ~ 
+        (lag(ple0055, order_by = syear) + lead(ple0055, order_by = syear)) / 2,  # Impute missing values
+      ple0055 >= 0 ~ ple0055,   # Keep valid non-negative values
+      TRUE ~ NA_real_           # Set all other cases to NA
+    ),
+    # Handle ple0056 transformations
+    ple0056 = case_when(
+      ple0056 < -2 ~ NA_real_,  # Transform values below -2 to NA
+      ple0056 == -2 ~ 0,        # Transform -2 to 0
+      ple0056 == -1 & 
+        !is.na(lag(ple0056, order_by = syear)) & 
+        !is.na(lead(ple0056, order_by = syear)) ~ 
+        (lag(ple0056, order_by = syear) + lead(ple0056, order_by = syear)) / 2,  # Impute missing values
+      ple0056 >= 0 ~ ple0056,   # Keep valid non-negative values
+      TRUE ~ NA_real_           # Set all other cases to NA
+    )
+  ) %>%
+  # Drop rows where either ple0055 or ple0056 is NA
+  filter(!is.na(ple0055) & !is.na(ple0056)) %>%
+  # Ensure both ple0055 and ple0056 are non-negative before calculation
+  mutate(
+    ple0055 = if_else(ple0055 < 0, NA_real_, ple0055),
+    ple0056 = if_else(ple0056 < 0, NA_real_, ple0056),
+    hospital_stay = ple0055 + ple0056  # Calculate hospital stay
+  ) %>%
+  # Drop rows with negative hospital_stay
+  filter(hospital_stay >= 0) %>%
+  # Drop original columns
+  select(-ple0055, -ple0056)
 
+#Visualisation: Histogram
+ggplot(main, aes(x = hospital_stay)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(
+    title = "Distribution of Hospital Stays",
+    x = "Number of Days in Hospital",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 3.3 Impairement Variables
+```{r}
+# Create impaired_stairs and impaired_tiring_tasks
+main <- main %>%
+  mutate(
+    # Handle ple0004 transformations
+    ple0004 = ifelse(ple0004 < -2, NA_real_, ple0004),
+    ple0004 = ifelse(
+      ple0004 == -1 & !is.na(lag(ple0004, order_by = syear)) & !is.na(lead(ple0004, order_by = syear)),
+      (lag(ple0004, order_by = syear) + lead(ple0004, order_by = syear)) / 2, ple0004
+    ),
+    ple0004 = ifelse(is.na(ple0004), 3, ple0004),  # Default unresolved NA to 3 ("no impairment")
+    
+    # Handle ple0005 transformations
+    ple0005 = ifelse(ple0005 < -2, NA_real_, ple0005),
+    ple0005 = ifelse(
+      ple0005 == -1 & !is.na(lag(ple0005, order_by = syear)) & !is.na(lead(ple0005, order_by = syear)),
+      (lag(ple0005, order_by = syear) + lead(ple0005, order_by = syear)) / 2, ple0005
+    ),
+    ple0005 = ifelse(is.na(ple0005), 3, ple0005)  # Default unresolved NA to 3 ("no impairment")
+  ) %>%
+  mutate(
+    # Calculate impaired_stairs
+    impaired_stairs = case_when(
+      ple0004 %in% c(1, 2) ~ 1,  # Impaired
+      ple0004 == 3 ~ 0        # Not impaired
+    ),
+    
+    # Calculate impaired_tiring_tasks
+    impaired_tiring_tasks = case_when(
+      ple0005 %in% c(1, 2) ~ 1,  # Impaired
+      ple0005 == 3 ~ 0         # Not impaired
+    )
+  ) %>%
+  # Drop rows where BOTH ple0004 and ple0005 are NA
+  filter(!is.na(impaired_tiring_tasks) & !is.na(impaired_stairs))
+
+#Visusalition: Bar plots- stairs
+ggplot(main, aes(x = factor(impaired_stairs))) +
+  geom_bar(fill = "skyblue", color = "black") +
+  labs(
+    title = "Distribution of Impaired Stairs",
+    x = "Impairment in Climbing Stairs (1 = Impaired, 0 = Not Impaired)",
+    y = "Count"
+  ) +
+  theme_minimal()
+#Visusalition: Bar plots- tiring tasks
+ggplot(main, aes(x = factor(impaired_tiring_tasks))) +
+  geom_bar(fill = "tomato", color = "black") +
+  labs(
+    title = "Distribution of Impaired Tiring Tasks",
+    x = "Impairment in Tiring Tasks (1 = Impaired, 0 = Not Impaired)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+## 3.4. Illnesses: Special Potential Specification
+```{r}
+# Create illnesses variable
+illness_vars <- c("ple0011", "ple0012", "ple0013", "ple0014", "ple0015", 
+                  "ple0016", "ple0017", "ple0018", "ple0019", "ple0020", 
+                  "ple0021", "ple0022", "ple0023")
+
+main <- main %>%
+  mutate(across(
+    all_of(illness_vars),
+    ~ case_when(
+      . == -2 ~ 0,
+      . < -2 ~ NA_real_,
+      . == -1 ~ NA_real_,
+      TRUE ~ .
+    )
+  )) %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
+  mutate(across(
+    all_of(illness_vars),
+    ~ if_else(is.na(.), lag(., order_by = syear), .)
+  )) %>%
+  mutate(across(
+    all_of(illness_vars),
+    ~ if_else(is.na(.), lead(., order_by = syear), .)
+  )) %>%
+  ungroup() %>%
+  mutate(illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE))
+#Visualisation: Histogram
+ggplot(main, aes(x = illnesses)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(
+    title = "Distribution of Illness Counts",
+    x = "Number of Illnesses",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+
+## 3.2 Predictors
+## 3.2.1 Life Satisfaction and Health Satisfaction
+```{r}
+# Create life_satisfaction and health_satisfaction variables
+main <- main %>%
+  filter(plh0182 >= 0 & plh0182 <= 10) %>%
+  mutate(
+    life_satisfaction = plh0182,
+    life_satisfaction_dummy = ifelse(plh0182 >= 5, 1, 0)
+  ) %>%
+  filter(plh0171 >= 0 & plh0171 <= 10) %>%
+  mutate(
+    health_satisfaction = plh0171,
+    health_satisfaction_dummy = ifelse(plh0171 >= 5, 1, 0)
+  )
+# Visualisation: Bar plot- Life Satisfaction
+ggplot(main, aes(x = factor(life_satisfaction))) +
+  geom_bar(fill = "skyblue", color = "black") +
+  labs(
+    title = "Distribution of Life Satisfaction",
+    x = "Life Satisfaction (0 = Lowest, 10 = Highest)",
+    y = "Count"
+  ) +
+  theme_minimal()
+# Visualisation: Bar plot- Health Satisfaction
+ggplot(main, aes(x = factor(health_satisfaction))) +
+  geom_bar(fill = "coral", color = "black") +
+  labs(
+    title = "Distribution of Health Satisfaction",
+    x = "Health Satisfaction (0 = Lowest, 10 = Highest)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 3.2.2 BMI
 ```{r}
 # Process height and weight
 main <- main %>%
@@ -244,120 +489,19 @@ main <- main %>%
       levels = c("Underweight", "Normal weight", "Overweight", "Obese")
     )
   )
+#Visusalisation: Histogram
+ggplot(main, aes(x = BMI)) +
+  geom_histogram(binwidth = 1, fill = "purple", color = "black", alpha = 0.7) +
+  labs(
+    title = "Distribution of BMI",
+    x = "BMI",
+    y = "Count"
+  ) +
+  theme_minimal()
+
 ```
 
-## 3.2 Subjective Health
-
-## 3.2.1 Life Satisfaction and Health Satisfaction
-
-```{r}
-# Create life_satisfaction and health_satisfaction variables
-main <- main %>%
-  filter(plh0182 >= 0 & plh0182 <= 10) %>%
-  mutate(
-    life_satisfaction = plh0182,
-    life_satisfaction_dummy = ifelse(plh0182 >= 5, 1, 0)
-  ) %>%
-  filter(plh0171 >= 0 & plh0171 <= 10) %>%
-  mutate(
-    health_satisfaction = plh0171,
-    health_satisfaction_dummy = ifelse(plh0171 >= 5, 1, 0)
-  )
-```
-
-## 3.2.2 Worries about job security, financial situation, and economic situation
-
-```{r}
-# Create variables for worries about job security, financial situation, and economic situation
-main <- main %>%
-  mutate(
-    worr_job_categorical = case_when(
-      plh0042 == -2 ~ 3,
-      plh0042 < 0 ~ NA_real_,
-      TRUE ~ plh0042
-    ),
-    worr_financial_categorical = case_when(
-      plh0033 == -2 ~ 3,
-      plh0033 < 0 ~ NA_real_,
-      TRUE ~ plh0033
-    ),
-    worr_economic_categorical = case_when(
-      plh0032 == -2 ~ 3,
-      plh0032 < 0 ~ NA_real_,
-      TRUE ~ plh0032
-    )
-  ) %>%
-  drop_na(worr_job_categorical, worr_financial_categorical, worr_economic_categorical) %>%
-  mutate(
-    worr_job_categorical = factor(
-      worr_job_categorical,
-      levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
-    ),
-    worr_financial_categorical = factor(
-      worr_financial_categorical,
-      levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
-    ),
-    worr_economic_categorical = factor(
-      worr_economic_categorical,
-      levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
-    ),
-    worr_job_dummy = ifelse(worr_job_categorical %in% c("worries a lot", "worries a little"), 1, 0),
-    worr_financial_dummy = ifelse(worr_financial_categorical %in% c("worries a lot", "worries a little"), 1, 0),
-    worr_economic_dummy = ifelse(worr_economic_categorical %in% c("worries a lot", "worries a little"), 1, 0)
-  ) %>%
-  select(-plh0042, -plh0033, -plh0032)
-```
-
-# 4. Control Variables
-
-## 4.1 Hospital Stay
-
-```{r}
-# Create `hospital_stay` variable
-main <- main %>%
-  mutate(
-    # Handle ple0055 transformations
-    ple0055 = case_when(
-      ple0055 < -2 ~ NA_real_,  # Transform values below -2 to NA
-      ple0055 == -2 ~ 0,        # Transform -2 to 0
-      ple0055 == -1 & 
-        !is.na(lag(ple0055, order_by = syear)) & 
-        !is.na(lead(ple0055, order_by = syear)) ~ 
-        (lag(ple0055, order_by = syear) + lead(ple0055, order_by = syear)) / 2,  # Impute missing values
-      ple0055 >= 0 ~ ple0055,   # Keep valid non-negative values
-      TRUE ~ NA_real_           # Set all other cases to NA
-    ),
-    # Handle ple0056 transformations
-    ple0056 = case_when(
-      ple0056 < -2 ~ NA_real_,  # Transform values below -2 to NA
-      ple0056 == -2 ~ 0,        # Transform -2 to 0
-      ple0056 == -1 & 
-        !is.na(lag(ple0056, order_by = syear)) & 
-        !is.na(lead(ple0056, order_by = syear)) ~ 
-        (lag(ple0056, order_by = syear) + lead(ple0056, order_by = syear)) / 2,  # Impute missing values
-      ple0056 >= 0 ~ ple0056,   # Keep valid non-negative values
-      TRUE ~ NA_real_           # Set all other cases to NA
-    )
-  ) %>%
-  # Drop rows where either ple0055 or ple0056 is NA
-  filter(!is.na(ple0055) & !is.na(ple0056)) %>%
-  # Ensure both ple0055 and ple0056 are non-negative before calculation
-  mutate(
-    ple0055 = if_else(ple0055 < 0, NA_real_, ple0055),
-    ple0056 = if_else(ple0056 < 0, NA_real_, ple0056),
-    hospital_stay = ple0055 + ple0056  # Calculate hospital stay
-  ) %>%
-  # Drop rows with negative hospital_stay
-  filter(hospital_stay >= 0) %>%
-  # Drop original columns
-  select(-ple0055, -ple0056)
-```
-
-## 4.2 Smoking and Number of Cigarettes
-
+## 3.2.3 Smoking and Number of Cigarettes
 ```{r}
 # Create `smoking_dummy`
 main <- main %>%
@@ -428,49 +572,115 @@ main <- main %>%
   filter(!is.na(ple0086_v4)) %>%
   # Create nb_of_cigarettes
   mutate(nb_of_cigarettes = ple0086_v4)
+#Visusalition: Pie Chart
+main %>%
+  group_by(smoking_dummy) %>%
+  summarize(count = n()) %>%
+  mutate(
+    proportion = count / sum(count),
+    label = paste0(round(proportion * 100, 1), "%")
+  ) %>%
+  ggplot(aes(x = "", y = proportion, fill = factor(smoking_dummy))) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  labs(
+    title = "Proportion of Smokers",
+    fill = "Smoking Status (1 = Smoker, 0 = Non-Smoker)"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5))
+
 ```
 
-## 4.3 Impairement Variables
-
+## 3.2.4 Diet: Special Potential Specification
 ```{r}
-# Create impaired_stairs and impaired_tiring_tasks
+# Create diet_healthy and diet_dummy
 main <- main %>%
   mutate(
-    # Handle ple0004 transformations
-    ple0004 = ifelse(ple0004 < -2, NA_real_, ple0004),
-    ple0004 = ifelse(
-      ple0004 == -1 & !is.na(lag(ple0004, order_by = syear)) & !is.na(lead(ple0004, order_by = syear)),
-      (lag(ple0004, order_by = syear) + lead(ple0004, order_by = syear)) / 2, ple0004
+    ple0095 = ifelse(ple0095 < 0, NA_real_, ple0095),
+    diet_categorical = factor(
+      ple0095, levels = c(1, 2, 3, 4),
+      labels = c("very healthy", "somewhat healthy", "somewhat unhealthy", "very unhealthy")
     ),
-    ple0004 = ifelse(is.na(ple0004), 3, ple0004),  # Default unresolved NA to 3 ("no impairment")
-    
-    # Handle ple0005 transformations
-    ple0005 = ifelse(ple0005 < -2, NA_real_, ple0005),
-    ple0005 = ifelse(
-      ple0005 == -1 & !is.na(lag(ple0005, order_by = syear)) & !is.na(lead(ple0005, order_by = syear)),
-      (lag(ple0005, order_by = syear) + lead(ple0005, order_by = syear)) / 2, ple0005
-    ),
-    ple0005 = ifelse(is.na(ple0005), 3, ple0005)  # Default unresolved NA to 3 ("no impairment")
-  ) %>%
-  mutate(
-    # Calculate impaired_stairs
-    impaired_stairs = case_when(
-      ple0004 %in% c(1, 2) ~ 1,  # Impaired
-      ple0004 == 3 ~ 0        # Not impaired
-    ),
-    
-    # Calculate impaired_tiring_tasks
-    impaired_tiring_tasks = case_when(
-      ple0005 %in% c(1, 2) ~ 1,  # Impaired
-      ple0005 == 3 ~ 0         # Not impaired
+    diet_dummy = case_when(
+      ple0095 %in% c(1, 2) ~ 1,
+      ple0095 %in% c(3, 4) ~ 0,
+      TRUE ~ NA_real_
     )
   ) %>%
-  # Drop rows where BOTH ple0004 and ple0005 are NA
-  filter(!is.na(impaired_tiring_tasks) & !is.na(impaired_stairs))
+  select(-ple0095)
+#Visusalition: Bar Plot
+ggplot(main, aes(x = diet_categorical)) +
+  geom_bar(fill = "darkgreen", color = "black") +
+  labs(
+    title = "Distribution of Diet Categories",
+    x = "Diet Category",
+    y = "Count"
+  ) +
+  theme_minimal()
 ```
 
-## 4.4 Tenure and Employment Status
+# 4. Control Variables
+## 4.1 Worries about job security, financial situation, and economic situation 
+```{r}
+# Create variables for worries about job security, financial situation, and economic situation
+main <- main %>%
+  mutate(
+    worr_job_categorical = case_when(
+      plh0042 == -2 ~ 3,
+      plh0042 < 0 ~ NA_real_,
+      TRUE ~ plh0042
+    ),
+    worr_financial_categorical = case_when(
+      plh0033 == -2 ~ 3,
+      plh0033 < 0 ~ NA_real_,
+      TRUE ~ plh0033
+    ),
+    worr_economic_categorical = case_when(
+      plh0032 == -2 ~ 3,
+      plh0032 < 0 ~ NA_real_,
+      TRUE ~ plh0032
+    )
+  ) %>%
+  drop_na(worr_job_categorical, worr_financial_categorical, worr_economic_categorical) %>%
+  mutate(
+    worr_job_categorical = factor(
+      worr_job_categorical,
+      levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_financial_categorical = factor(
+      worr_financial_categorical,
+      levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_economic_categorical = factor(
+      worr_economic_categorical,
+      levels = c(1, 2, 3),
+      labels = c("worries a lot", "worries a little", "no worries")
+    ),
+    worr_job_dummy = ifelse(worr_job_categorical %in% c("worries a lot", "worries a little"), 1, 0),
+    worr_financial_dummy = ifelse(worr_financial_categorical %in% c("worries a lot", "worries a little"), 1, 0),
+    worr_economic_dummy = ifelse(worr_economic_categorical %in% c("worries a lot", "worries a little"), 1, 0)
+  ) %>%
+  select(-plh0042, -plh0033, -plh0032)
 
+#Visualisation: Bar Plots
+main %>%
+  select(worr_job_categorical, worr_financial_categorical, worr_economic_categorical) %>%
+  pivot_longer(cols = everything(), names_to = "Worry_Type", values_to = "Worry_Level") %>%
+  ggplot(aes(x = Worry_Level, fill = Worry_Type)) +
+  geom_bar(position = "dodge", color = "black") +
+  labs(
+    title = "Distribution of Worries About Job Security, Financial, and Economic Situation",
+    x = "Worry Level",
+    y = "Count",
+    fill = "Worry Type"
+  ) +
+  theme_minimal()
+```
+
+## 4.2 Tenure and Employment Status
 ```{r}
 # Transform tenure (pgerwzeit) and employment status (pgemplst)
 main <- main %>%
@@ -509,10 +719,20 @@ main <- main %>%
     )
   ) %>%
   select(-pgemplst)  # Drop the original `pgemplst` column
+
+#Visualisation: Bar Plots
+ggplot(main, aes(x = employment_status_categorical)) +
+  geom_bar(fill = "steelblue", color = "black") +
+  labs(
+    title = "Distribution of Employment Status",
+    x = "Employment Status",
+    y = "Count"
+  ) +
+  theme_minimal()
+
 ```
 
-## 4.5 Net Income
-
+## 4.3 Net Income and Working time per week
 ```{r}
 # Transform `pglabnet` into `net_income`
 main <- main %>%
@@ -537,11 +757,28 @@ main <- main %>%
   ) %>%
   drop_na(work_time_weekly) %>%  # Remove rows with NA values in work_time_weekly
   select(-pgtatzeit)  # Drop the original `pgtatzeit` column
+#Visualisation: Histogram- Net Income
+ggplot(main, aes(x = net_income)) +
+  geom_histogram(binwidth = 500, fill = "darkgreen", color = "black") +
+  labs(
+    title = "Distribution of Net Income",
+    x = "Net Income",
+    y = "Count"
+  ) +
+  theme_minimal()
+#Visualisation: Histogram- Work Time Weekly
+ggplot(main, aes(x = work_time_weekly)) +
+  geom_histogram(binwidth = 5, fill = "orange", color = "black") +
+  labs(
+    title = "Distribution of Work Time Weekly",
+    x = "Work Time (Hours/Week)",
+    y = "Count"
+  ) +
+  theme_minimal()
 
 ```
 
-## 4.6 Unemployment
-
+## 4.4 Unemployment
 ```{r}
 # Transform total years unemployed (pgexpue)
 main <- main %>%
@@ -554,10 +791,18 @@ main <- main %>%
   ) %>%
   drop_na(total_years_unemployment) %>%
   select(-pgexpue)
+#Visualisation: Bar Plot
+ggplot(main, aes(x = total_years_unemployment)) +
+  geom_bar(fill = "purple", color = "black") +
+  labs(
+    title = "Distribution of Total Years Unemployed",
+    x = "Total Years Unemployed",
+    y = "Count"
+  ) +
+  theme_minimal()
 ```
 
-## 4.7 Occupational Status
-
+## 4.5 Occupational Status
 ```{r}
 # Transform occupational status (pgstib)
 main <- main %>%
@@ -589,10 +834,19 @@ occup_status_labels <- c(
 )
 
 main$occup_status <- factor(main$occup_status, levels = 1:8, labels = occup_status_labels)
+#Visualisation: Bar Plot
+ggplot(main, aes(x = occup_status)) +
+  geom_bar(fill = "darkred", color = "black") +
+  labs(
+    title = "Distribution of Occupational Status",
+    x = "Occupational Status",
+    y = "Count"
+  ) +
+  theme_minimal()
+
 ```
 
-## 4.8 Gender
-
+## 4.6 Gender
 ```{r}
 # Transform sex into male dummy
 main <- main %>%
@@ -608,11 +862,26 @@ main <- main %>%
   ungroup() %>%
   drop_na(male) %>%
   select(-sex)
-
+#Visualisation: Pie Chart
+main %>%
+  group_by(male) %>%
+  summarize(count = n()) %>%
+  mutate(
+    proportion = count / sum(count),
+    label = paste0(round(proportion * 100, 1), "%")
+  ) %>%
+  ggplot(aes(x = "", y = proportion, fill = factor(male, labels = c("Female", "Male")))) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  labs(
+    title = "Proportion of Male vs. Female",
+    fill = "Gender"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5))
 ```
 
-## 4.8 Migration Background
-
+## 4.7 Migration Background
 ```{r}
 # Transform migration background and create dummy
 main <- main %>%
@@ -635,10 +904,19 @@ main <- main %>%
     ),
     migback_dummy = ifelse(migback %in% c("direct migration", "indirect migration"), 1, 0)
   )
+#Visualisation: Bar plot
+ggplot(main, aes(x = migback)) +
+  geom_bar(fill = "cyan", color = "black") +
+  labs(
+    title = "Distribution of Migration Background",
+    x = "Migration Background",
+    y = "Count"
+  ) +
+  theme_minimal()
+
 ```
 
-## 4.9 Born In Germany
-
+## 4.8 Born In Germany
 ```{r}
 main <- main %>%
   mutate(
@@ -652,10 +930,18 @@ main <- main %>%
   mutate(germborn = if_else(is.na(germborn), first(na.omit(germborn)), germborn)) %>%
   ungroup() %>%
   drop_na(germborn)
+#Visualisation: Bar Plot
+ggplot(main, aes(x = factor(germborn, labels = c("Not Born in Germany", "Born in Germany")))) +
+  geom_bar(fill = "pink", color = "black") +
+  labs(
+    title = "Proportion of Individuals Born in Germany",
+    x = "Born in Germany",
+    y = "Count"
+  ) +
+  theme_minimal()
 ```
 
-## 4.10 Age: Filtering for age between 25 and 55
-
+## 4.9 Age: Filtering for age between 25 and 55
 ```{r}
 # Create age and filter age range
 main <- main %>%
@@ -663,64 +949,19 @@ main <- main %>%
   filter(!is.na(ple0010_h) & ple0010_h > 0) %>%
   filter(age >= 25 & age <= 55) %>%
   select(-ple0010_h)
-```
+#Visualisation: Histogram
+ggplot(main, aes(x = age)) +
+  geom_histogram(binwidth = 5, fill = "gold", color = "black") +
+  labs(
+    title = "Distribution of Age (25-55 Years)",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
 
-# Special Potential Specifications
-
-## 1. Illnesses
-
-```{r}
-# Create illnesses variable
-illness_vars <- c("ple0011", "ple0012", "ple0013", "ple0014", "ple0015", 
-                  "ple0016", "ple0017", "ple0018", "ple0019", "ple0020", 
-                  "ple0021", "ple0022", "ple0023")
-
-main <- main %>%
-  mutate(across(
-    all_of(illness_vars),
-    ~ case_when(
-      . == -2 ~ 0,
-      . < -2 ~ NA_real_,
-      . == -1 ~ NA_real_,
-      TRUE ~ .
-    )
-  )) %>%
-  arrange(pid, syear) %>%
-  group_by(pid) %>%
-  mutate(across(
-    all_of(illness_vars),
-    ~ if_else(is.na(.), lag(., order_by = syear), .)
-  )) %>%
-  mutate(across(
-    all_of(illness_vars),
-    ~ if_else(is.na(.), lead(., order_by = syear), .)
-  )) %>%
-  ungroup() %>%
-  mutate(illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE))
-```
-
-## 2. Diet
-
-```{r}
-# Create diet_healthy and diet_dummy
-main <- main %>%
-  mutate(
-    ple0095 = ifelse(ple0095 < 0, NA_real_, ple0095),
-    diet_categorical = factor(
-      ple0095, levels = c(1, 2, 3, 4),
-      labels = c("very healthy", "somewhat healthy", "somewhat unhealthy", "very unhealthy")
-    ),
-    diet_dummy = case_when(
-      ple0095 %in% c(1, 2) ~ 1,
-      ple0095 %in% c(3, 4) ~ 0,
-      TRUE ~ NA_real_
-    )
-  ) %>%
-  select(-ple0095)
 ```
 
 # Final Cleanup: Keeping relevant variables
-
 ```{r}
 # Select only the relevant variables
 main <- main %>%
@@ -737,4 +978,10 @@ main <- main %>%
 
 #Display the summary of the dataset
 summary(main)
+```
+
+# Saving the cleaned dataset
+```{r}
+# Save the final main dataset as a CSV file
+write.csv(main, "SOEP_main_final.csv", row.names = FALSE)
 ```
