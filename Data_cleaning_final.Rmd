@@ -49,7 +49,7 @@ main <- read_dta('/Users/salmahoumane/Documents/R/pl.dta') %>%
 ```{r}
 # Merge with `pgen` dataset
 data_pgen <- read_dta('/Users/salmahoumane/Documents/R/pgen.dta') %>%
-  select("pid", "syear", "pgerwzeit", "pgemplst", "pglabnet", "pgtatzeit", "pgexpue", "pgstib")
+  select("pid", "syear", "pgerwzeit", "pgemplst", "pglabnet", "pgtatzeit", "pgexpue", "pgstib","pgfamstd")
 main <- merge(main, data_pgen, by = c("pid", "syear"), all.x = TRUE)
 
 # Merge with `ppathl` dataset
@@ -74,13 +74,15 @@ main <- main %>%
 # Clean and rename the `health` variable
 main <- main %>%
   rename(health = ple0008) %>%
-  filter(health > -1)
+  filter(health > 0) %>%  # Filter valid health values
+  mutate(health = 6 - health)  # Reverse the scale: 1 -> 5, 5 -> 1
+
 # Visualisation: Bar plot
 ggplot(main, aes(x = factor(health))) +
   geom_bar(fill = "steelblue") +
   labs(
     title = "Distribution of Self-Assessed Health",
-    x = "Health Category (1 = Excellent, 5 = Poor)",
+    x = "Health Category (1 = Poor, 5 = Excellent)",
     y = "Count"
   ) +
   theme_minimal()
@@ -90,6 +92,13 @@ ggplot(main, aes(x = factor(health))) +
 
 ```{r}
 # Create `worr_health_categorical` and `worr_health_dummy`
+# Calculate the number of missing values in `plh0035` (worries about health) for each year
+missing_counts <- main %>%
+  group_by(syear) %>%
+  summarise(missing_count = sum(plh0035 < 0, na.rm = TRUE))
+# Visualization
+print(missing_counts)
+## There are a lot of missing in years 2011, 2012 and 2013. Not to lose too many information, we will impute these values within each person with the mean of 2010 and 2014, other missings will be dropped.
 main <- main %>%
   rename(worr_health_categorical = plh0035) %>%
   mutate(
@@ -102,9 +111,11 @@ main <- main %>%
   mutate(
     worr_health_categorical = if_else(
       syear %in% c(2011, 2012, 2013) & is.na(worr_health_categorical),
-      mean(
-        worr_health_categorical[syear %in% c(2010, 2014)],
-        na.rm = TRUE
+      floor(
+        mean(
+          worr_health_categorical[syear %in% c(2010, 2014)],
+          na.rm = TRUE
+        )
       ),
       worr_health_categorical
     )
@@ -113,8 +124,8 @@ main <- main %>%
   drop_na(worr_health_categorical) %>%
   mutate(
     worr_health_categorical = factor(
-      worr_health_categorical, levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
+      worr_health_categorical, levels = c(3, 2, 1),
+      labels = c("no worries", "worries a little", "worries a lot")
     ),
     worr_health_dummy = if_else(
       worr_health_categorical %in% c("worries a lot", "worries a little"), 1, 0
@@ -220,6 +231,14 @@ gripstr <- read_dta("/Users/salmahoumane/Documents/R/gripstr.dta") %>%
 main <- main %>%
   left_join(gripstr, by = c("pid", "syear"))
 
+# Calculate the number of missing values in grip strength columns for each year
+missing_counts_gripstr <- main %>%
+  group_by(syear) %>%
+  summarise(missing_avg_grip = sum(is.na(avg_grip)))
+
+# Display the results
+print(missing_counts_gripstr)
+
 # Visualisation: Histogram 
 ggplot(main, aes(x = avg_grip)) +
   geom_histogram(binwidth = 20, fill = "steelblue", color = "black", alpha = 0.7) +
@@ -238,25 +257,23 @@ main <- main %>%
   mutate(
     # Handle ple0055 transformations
     ple0055 = case_when(
-      ple0055 < -2 ~ NA_real_,  # Transform values below -2 to NA
-      ple0055 == -2 ~ 0,        # Transform -2 to 0
-      ple0055 == -1 & 
+      ple0055 %in% c(-1, -3) ~ NA_real_,  # Drop rows where values indicate refusal (-1, -3)
+      ple0055 %in% c(-8, -5) & 
         !is.na(lag(ple0055, order_by = syear)) & 
         !is.na(lead(ple0055, order_by = syear)) ~ 
         (lag(ple0055, order_by = syear) + lead(ple0055, order_by = syear)) / 2,  # Impute missing values
-      ple0055 >= 0 ~ ple0055,   # Keep valid non-negative values
-      TRUE ~ NA_real_           # Set all other cases to NA
+      ple0055 >= 0 ~ ple0055,  # Keep valid non-negative values
+      TRUE ~ NA_real_  # Set all other cases to NA
     ),
     # Handle ple0056 transformations
     ple0056 = case_when(
-      ple0056 < -2 ~ NA_real_,  # Transform values below -2 to NA
-      ple0056 == -2 ~ 0,        # Transform -2 to 0
-      ple0056 == -1 & 
+      ple0056 %in% c(-1, -3) ~ NA_real_,  # Drop rows where values indicate refusal (-1, -3)
+      ple0056 %in% c(-8, -5) & 
         !is.na(lag(ple0056, order_by = syear)) & 
         !is.na(lead(ple0056, order_by = syear)) ~ 
         (lag(ple0056, order_by = syear) + lead(ple0056, order_by = syear)) / 2,  # Impute missing values
-      ple0056 >= 0 ~ ple0056,   # Keep valid non-negative values
-      TRUE ~ NA_real_           # Set all other cases to NA
+      ple0056 >= 0 ~ ple0056,  # Keep valid non-negative values
+      TRUE ~ NA_real_  # Set all other cases to NA
     )
   ) %>%
   # Drop rows where either ple0055 or ple0056 is NA
@@ -271,7 +288,6 @@ main <- main %>%
   filter(hospital_stay >= 0) %>%
   # Drop original columns
   select(-ple0055, -ple0056)
-
 #Visualisation: Histogram
 ggplot(main, aes(x = hospital_stay)) +
   geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7) +
@@ -287,11 +303,17 @@ ggplot(main, aes(x = hospital_stay)) +
 ```{r}
 # Create impaired_stairs and impaired_tiring_tasks
 main <- main %>%
+  group_by(pid) %>%
   mutate(
     # Handle ple0004 transformations
     ple0004 = ifelse(ple0004 < -2, NA_real_, ple0004),
+    ple0004 = if_else(
+      syear %in% 1999:2001 & is.na(ple0004),
+      ple0004[syear == 2002][1],  # Use the 2002 value if it exists
+      ple0004
+     ),
     ple0004 = ifelse(
-      ple0004 == -1 & !is.na(lag(ple0004, order_by = syear)) & !is.na(lead(ple0004, order_by = syear)),
+      ple0004 %in% c(-5, -8) & !is.na(lag(ple0004, order_by = syear)) & !is.na(lead(ple0004, order_by = syear)),
       (lag(ple0004, order_by = syear) + lead(ple0004, order_by = syear)) / 2, ple0004
     ),
     ple0004 = ifelse(is.na(ple0004), 3, ple0004),  # Default unresolved NA to 3 ("no impairment")
@@ -304,6 +326,7 @@ main <- main %>%
     ),
     ple0005 = ifelse(is.na(ple0005), 3, ple0005)  # Default unresolved NA to 3 ("no impairment")
   ) %>%
+  ungroup() %>% 
   mutate(
     # Calculate impaired_stairs
     impaired_stairs = case_when(
@@ -329,16 +352,6 @@ ggplot(main, aes(x = factor(impaired_stairs))) +
     y = "Count"
   ) +
   theme_minimal()
-#Visusalition: Bar plots- tiring tasks
-ggplot(main, aes(x = factor(impaired_tiring_tasks))) +
-  geom_bar(fill = "tomato", color = "black") +
-  labs(
-    title = "Distribution of Impaired Tiring Tasks",
-    x = "Impairment in Tiring Tasks (1 = Impaired, 0 = Not Impaired)",
-    y = "Count"
-  ) +
-  theme_minimal()
-
 ```
 
 ## 3.4. Illnesses: Special Potential Specification
@@ -349,15 +362,27 @@ illness_vars <- c("ple0011", "ple0012", "ple0013", "ple0014", "ple0015",
                   "ple0021", "ple0022", "ple0023")
 
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(across(
     all_of(illness_vars),
     ~ case_when(
-      . == -2 ~ 0,
-      . < -2 ~ NA_real_,
-      . == -1 ~ NA_real_,
-      TRUE ~ .
+      . %in% c(-8, -5) ~ {  # Impute -8 and -5 using the closest year's value
+        temp <- .
+        for (i in seq_along(temp)) {
+          if (temp[i] %in% c(-8, -5)) {
+            lag_val <- lag(temp, default = NA_real_, order_by = syear)[i]
+            lead_val <- lead(temp, default = NA_real_, order_by = syear)[i]
+            temp[i] <- if (!is.na(lag_val)) lag_val else lead_val
+          }
+        }
+        temp
+      },
+      . == -2 ~ 0,  # Transform -2 into 0
+      TRUE ~ .  # Keep all other valid values
     )
   )) %>%
+  ungroup() %>%
   arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(across(
@@ -369,10 +394,21 @@ main <- main %>%
     ~ if_else(is.na(.), lead(., order_by = syear), .)
   )) %>%
   ungroup() %>%
-  mutate(illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE))
-#Visualisation: Histogram
+  mutate(across(
+    all_of(illness_vars),
+    ~ if_else(. < 0, NA_real_, .)  # Replace remaining negative values with NA
+  )) %>%
+  mutate(
+    illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE)  # Calculate the sum of illnesses
+  )
+# Ensure illnesses is rounded to integers
+main <- main %>%
+  mutate(illnesses = round(illnesses))
+
+# Visualisation: Histogram with integer bins
 ggplot(main, aes(x = illnesses)) +
-  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7, center = 0.5) +
+  scale_x_continuous(breaks = seq(0, max(main$illnesses, na.rm = TRUE), by = 1)) +
   labs(
     title = "Distribution of Illness Counts",
     x = "Number of Illnesses",
@@ -388,15 +424,46 @@ ggplot(main, aes(x = illnesses)) +
 ```{r}
 # Create life_satisfaction and health_satisfaction variables
 main <- main %>%
-  filter(plh0182 >= 0 & plh0182 <= 10) %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
-    life_satisfaction = plh0182,
-    life_satisfaction_dummy = ifelse(plh0182 >= 5, 1, 0)
+    # Impute for plh0182
+    plh0182 = ifelse(plh0182 %in% c(-5, -8), NA_real_, plh0182),  # Replace -5 and -8 with NA
+    plh0182 = {
+      temp <- plh0182
+      for (i in seq_len(n())) {
+        # Check for missing values and use nearest available value from lag or lead
+        if (is.na(temp[i])) {
+          lag_val <- lag(temp, default = NA_real_, order_by = syear)[i]
+          lead_val <- lead(temp, default = NA_real_, order_by = syear)[i]
+          temp[i] <- if (!is.na(lag_val)) lag_val else lead_val
+        }
+      }
+      temp
+    },
+    # Impute for plh0171
+    plh0171 = ifelse(plh0171 %in% c(-5, -8), NA_real_, plh0171),  # Replace -5 and -8 with NA
+    plh0171 = {
+      temp <- plh0171
+      for (i in seq_len(n())) {
+        # Check for missing values and use nearest available value from lag or lead
+        if (is.na(temp[i])) {
+          lag_val <- lag(temp, default = NA_real_, order_by = syear)[i]
+          lead_val <- lead(temp, default = NA_real_, order_by = syear)[i]
+          temp[i] <- if (!is.na(lag_val)) lag_val else lead_val
+        }
+      }
+      temp
+    }
   ) %>%
-  filter(plh0171 >= 0 & plh0171 <= 10) %>%
+  ungroup() %>%
+  filter(plh0182 >= 0 & plh0182 <= 10) %>%  # Filter valid range for life satisfaction
   mutate(
-    health_satisfaction = plh0171,
-    health_satisfaction_dummy = ifelse(plh0171 >= 5, 1, 0)
+    life_satisfaction = plh0182
+  ) %>%
+  filter(plh0171 >= 0 & plh0171 <= 10) %>%  # Filter valid range for health satisfaction
+  mutate(
+    health_satisfaction = plh0171
   )
 # Visualisation: Bar plot- Life Satisfaction
 ggplot(main, aes(x = factor(life_satisfaction))) +
@@ -436,19 +503,17 @@ main <- main %>%
     # Impute missing `height` using the first non-NA value within the same `pid`
     height = if_else(
       is.na(height),
-      first(na.omit(height), default = NA_real_),  # Use first valid value or keep NA if none exist
+      last(na.omit(height), default = NA_real_),  # Use the latest valid value or keep NA if none exist
       height
     )
   ) %>%
   ungroup() %>%
-  drop_na(height) %>%  # Drop rows where `height` remains NA
-  select(-ple0006)  # Drop the original `ple0006` column
+  drop_na(height)  # Drop rows where `height` remains NA
 
 main <- main %>%
   mutate(
     # Rename and handle outliers
     weight = case_when(
-      ple0007 > 220 ~ NA_real_,  # Outliers above 220 kg are set to NA
       ple0007 > 0 ~ ple0007,     # Valid values
       TRUE ~ NA_real_            # Other invalid values to NA
     )
@@ -505,6 +570,42 @@ ggplot(main, aes(x = BMI)) +
 ```{r}
 # Create `smoking_dummy`
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
+  mutate(
+    # Impute -5 or -8 using dynamic lag and lead
+    ple0081_h = ifelse(ple0081_h %in% c(-5, -8), NA_real_, ple0081_h),
+    ple0081_h = {
+      temp <- ple0081_h
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          # Check lag and lead values iteratively
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    }
+  ) %>%
+  ungroup() %>%
   # Transform ple0081_h
   mutate(
     ple0081_h = case_when(
@@ -513,65 +614,59 @@ main <- main %>%
       TRUE ~ NA_real_  # Set all other cases to NA
     )
   ) %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by individual and year
-  group_by(pid) %>%
-  mutate(
-    # Impute missing values (-1) using the value from 2 years ago
-    ple0081_h = if_else(
-      is.na(ple0081_h) & lag(ple0081_h, 2) > 0,
-      lag(ple0081_h, 2),
-      ple0081_h
-    ),
-    # Impute missing values for intermediate years with the previous year's value
-    ple0081_h = if_else(
-      is.na(ple0081_h),
-      lag(ple0081_h),
-      ple0081_h
-    )
-  ) %>%
-  ungroup() %>%
-  # Drop rows where ple0081_h remains NA
-  filter(!is.na(ple0081_h)) %>%
+  filter(!is.na(ple0081_h)) %>%  # Drop rows where ple0081_h remains NA
   # Create smoking_dummy
-  mutate(
-    smoking_dummy = if_else(ple0081_h == 1, 1, 0)  # 1 for yes, 0 for no
-  )
+  mutate(smoking_dummy = if_else(ple0081_h == 1, 1, 0))  # 1 for yes, 0 for no
+
 # Creating number of cigarettes
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
+  mutate(
+    # Impute -5 or -8 using dynamic lag and lead
+    ple0086_v4 = ifelse(ple0086_v4 %in% c(-5, -8), NA_real_, ple0086_v4),
+    ple0086_v4 = {
+      temp <- ple0086_v4
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    }
+  ) %>%
+  ungroup() %>%
   mutate(
     # Handle ple0086_v4 values
     ple0086_v4 = case_when(
       ple0086_v4 == -2 ~ 0,  # Treat -2 as 0
       ple0086_v4 >= 0 ~ ple0086_v4,  # Keep valid values
-      TRUE ~ NA_real_  # Set invalid values (e.g., -1) to NA for further imputation
+      TRUE ~ NA_real_  # Set invalid values to NA
     )
   ) %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by individual and year
-  group_by(pid) %>%
-  mutate(
-    # Copy 2002 values to earlier years, only if 2002 value exists
-    ple0086_v4 = case_when(
-      syear %in% c(1999, 2000, 2001, 2003) & is.na(ple0086_v4) &
-        any(syear == 2002 & !is.na(ple0086_v4)) ~ first(ple0086_v4[syear == 2002]),
-      TRUE ~ ple0086_v4
-    ),
-    # Copy even-year values to the following odd year, if available
-    ple0086_v4 = case_when(
-      syear %% 2 == 1 & is.na(ple0086_v4) &
-        !is.na(lag(ple0086_v4, order_by = syear)) ~ lag(ple0086_v4, order_by = syear),
-      TRUE ~ ple0086_v4
-    ),
-    # Impute remaining NA using the value from 2 years ago
-    ple0086_v4 = case_when(
-      is.na(ple0086_v4) & lag(ple0086_v4, 2, order_by = syear) > 0 ~ lag(ple0086_v4, 2, order_by = syear),
-      TRUE ~ ple0086_v4
-    )
-  ) %>%
-  ungroup() %>%
-  # Drop rows where ple0086_v4 remains NA
-  filter(!is.na(ple0086_v4)) %>%
+  filter(!is.na(ple0086_v4)) %>%  # Drop rows where ple0086_v4 remains NA
   # Create nb_of_cigarettes
   mutate(nb_of_cigarettes = ple0086_v4)
+
 #Visusalition: Pie Chart
 main %>%
   group_by(smoking_dummy) %>%
@@ -589,7 +684,6 @@ main %>%
   ) +
   theme_minimal() +
   geom_text(aes(label = label), position = position_stack(vjust = 0.5))
-
 ```
 
 ## 3.2.4 Diet: Special Potential Specification
@@ -625,17 +719,119 @@ ggplot(main, aes(x = diet_categorical)) +
 ```{r}
 # Create variables for worries about job security, financial situation, and economic situation
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
+    # Impute -5 or -8 for `plh0042` using dynamic lag and lead
+    plh0042 = ifelse(plh0042 %in% c(-5, -8), NA_real_, plh0042),
+    plh0042 = {
+      temp <- plh0042
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          # Check lag and lead values iteratively
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            # Choose the closest valid value
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    },
+    
+    # Repeat for `plh0033`
+    plh0033 = ifelse(plh0033 %in% c(-5, -8), NA_real_, plh0033),
+    plh0033 = {
+      temp <- plh0033
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    },
+    
+    # Repeat for `plh0032`
+    plh0032 = ifelse(plh0032 %in% c(-5, -8), NA_real_, plh0032),
+    plh0032 = {
+      temp <- plh0032
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    }
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Transformations for `worr_job_categorical`
     worr_job_categorical = case_when(
       plh0042 == -2 ~ 3,
       plh0042 < 0 ~ NA_real_,
       TRUE ~ plh0042
     ),
+    # Transformations for `worr_financial_categorical`
     worr_financial_categorical = case_when(
       plh0033 == -2 ~ 3,
       plh0033 < 0 ~ NA_real_,
       TRUE ~ plh0033
     ),
+    # Transformations for `worr_economic_categorical`
     worr_economic_categorical = case_when(
       plh0032 == -2 ~ 3,
       plh0032 < 0 ~ NA_real_,
@@ -646,18 +842,18 @@ main <- main %>%
   mutate(
     worr_job_categorical = factor(
       worr_job_categorical,
-      levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
+      levels = c(3, 2, 1),
+      labels = c("no worries", "worries a little", "worries a lot")
     ),
     worr_financial_categorical = factor(
       worr_financial_categorical,
-      levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
+      levels = c(3, 2, 1),
+      labels = c("no worries", "worries a little", "worries a lot")
     ),
     worr_economic_categorical = factor(
       worr_economic_categorical,
-      levels = c(1, 2, 3),
-      labels = c("worries a lot", "worries a little", "no worries")
+      levels = c(3, 2, 1),
+      labels = c("no worries", "worries a little", "worries a lot")
     ),
     worr_job_dummy = ifelse(worr_job_categorical %in% c("worries a lot", "worries a little"), 1, 0),
     worr_financial_dummy = ifelse(worr_financial_categorical %in% c("worries a lot", "worries a little"), 1, 0),
@@ -684,12 +880,49 @@ main %>%
 ```{r}
 # Transform tenure (pgerwzeit) and employment status (pgemplst)
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
-    tenure = case_when(
-      pgerwzeit == -2 ~ 0,
-      pgerwzeit < 0 ~ NA_real_,
-      TRUE ~ pgerwzeit
-    ),
+    # Impute -5 or -8 for `pgerwzeit` using dynamic lag and lead
+    tenure = ifelse(pgerwzeit %in% c(-5, -8), NA_real_, pgerwzeit),
+    tenure = {
+      temp <- tenure
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          # Check lag and lead values iteratively
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            # Choose the closest valid value
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    },
+    # Set `-2` to 0
+    tenure = ifelse(is.na(tenure) & pgerwzeit == -2, 0, tenure)
+  ) %>%
+  ungroup() %>%  # Ungroup after grouped operations
+  mutate(
+    tenure = ifelse(tenure < 0, NA_real_, tenure)  # Ensure no negative tenure remains
+  ) %>%  
+  mutate(
     employment_status_categorical = case_when(
       pgemplst == -2 ~ 5,
       pgemplst == 1 ~ 1,
@@ -735,27 +968,99 @@ ggplot(main, aes(x = employment_status_categorical)) +
 ## 4.3 Net Income and Working time per week
 ```{r}
 # Transform `pglabnet` into `net_income`
+# Handle `net_income` transformation
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
+    net_income = ifelse(pglabnet %in% c(-5, -8), NA_real_, pglabnet),  # Replace -5 and -8 with NA
+    # Iterative imputation using lag and lead
+    net_income = {
+      temp <- net_income
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          # Check lag and lead values iteratively
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            # Choose the closest valid value
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    },
+    # Additional rules for specific values
     net_income = case_when(
-      pglabnet == 99999 ~ NA_real_, # Treat `99999` as missing
-      pglabnet == -2 ~ 0,  # Set net income to 0 for "do not apply"
-      pglabnet < 0 ~ NA_real_,  # Drop all other negative values by setting them to NA
-      TRUE ~ pglabnet  # Keep valid values as is
+      net_income == 99999 ~ NA_real_,  # Treat `99999` as missing
+      net_income == -2 ~ 0,  # Set `-2` to 0
+      TRUE ~ net_income  # Keep valid values
     )
   ) %>%
-  drop_na(net_income) %>%  # Remove rows with NA values in net_income
+  ungroup() %>%
+  drop_na(net_income) %>%  # Remove rows where imputation still results in NA
   select(-pglabnet)  # Drop the original `pglabnet` column
-# Transform `pgtatzeit` into `work_time_weekly`
+
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
+    work_time_weekly = ifelse(pgtatzeit %in% c(-5, -8), NA_real_, pgtatzeit),  # Replace -5 and -8 with NA
+    # Iterative imputation using lag and lead
+    work_time_weekly = {
+      temp <- work_time_weekly
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          # Check lag and lead values iteratively
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            # Choose the closest valid value
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            temp[i] <- temp[nearest]
+          }
+        }
+      }
+      temp
+    },
+    # Additional rules for specific values
     work_time_weekly = case_when(
-      pgtatzeit == -2 ~ 0,  # Set work time to 0 for "do not apply"
-      pgtatzeit < 0 ~ NA_real_,  # Drop all other negative values by setting them to NA
-      TRUE ~ pgtatzeit  # Keep valid values as is
+      work_time_weekly == -2 ~ 0,  # Set `-2` to 0
+      work_time_weekly >= 0 ~ work_time_weekly,  # Keep valid non-negative values
+      TRUE ~ NA_real_  # Set all other cases to NA
     )
   ) %>%
-  drop_na(work_time_weekly) %>%  # Remove rows with NA values in work_time_weekly
+  ungroup() %>%
+  drop_na(work_time_weekly) %>%  # Remove rows where imputation still results in NA
   select(-pgtatzeit)  # Drop the original `pgtatzeit` column
 #Visualisation: Histogram- Net Income
 ggplot(main, aes(x = net_income)) +
@@ -782,14 +1087,51 @@ ggplot(main, aes(x = work_time_weekly)) +
 ```{r}
 # Transform total years unemployed (pgexpue)
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
-    total_years_unemployment = case_when(
-      pgexpue == -2 ~ 0,
-      pgexpue < 0 ~ NA_real_,
-      TRUE ~ pgexpue
-    )
+    # Replace -5 and -8 with NA for imputation
+    total_years_unemployment = ifelse(pgexpue %in% c(-5, -8), NA_real_, pgexpue),
+    # Iterative imputation with adjustment for year differences
+    total_years_unemployment = {
+      temp <- total_years_unemployment
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          # Find the nearest valid value in lag or lead
+          lag_idx <- which(!is.na(temp) & row_number() < i)
+          lead_idx <- which(!is.na(temp) & row_number() > i)
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            # Choose the closer value between lag and lead
+            nearest <- ifelse(
+              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
+              lag_idx[length(lag_idx)],
+              lead_idx[1]
+            )
+          } else if (length(lag_idx) > 0) {
+            nearest <- lag_idx[length(lag_idx)]
+          } else if (length(lead_idx) > 0) {
+            nearest <- lead_idx[1]
+          } else {
+            nearest <- NA
+          }
+          
+          if (!is.na(nearest)) {
+            # Adjust for the difference in years
+            year_diff <- syear[i] - syear[nearest]
+            temp[i] <- temp[nearest] - year_diff
+          }
+        }
+      }
+      temp
+    },
+    # Transform -2 into 0 after imputation
+    total_years_unemployment = ifelse(total_years_unemployment == -2, 0, total_years_unemployment)
   ) %>%
+  ungroup() %>%
+  # Drop rows where the value remains NA after imputation
   drop_na(total_years_unemployment) %>%
+  # Remove the original `pgexpue` column
   select(-pgexpue)
 #Visualisation: Bar Plot
 ggplot(main, aes(x = total_years_unemployment)) +
@@ -916,6 +1258,31 @@ ggplot(main, aes(x = migback)) +
 
 ```
 
+## 4.8 Marital Status
+```{r}
+main <- main %>%
+  mutate(
+    pgfamstd = case_when(
+      pgfamstd < 0 ~ NA_real_,       # Replace negative values with NA
+      TRUE ~ pgfamstd                # Keep the original value otherwise
+    )
+  ) %>%
+  mutate(
+    pgfamstd_dummy = case_when(
+      pgfamstd %in% c(1, 6, 7, 8) ~ "married",
+      pgfamstd %in% c(2, 3, 4, 5) ~ "single",
+      TRUE ~ NA_character_  ) )      # Handle unexpected missings
+# Visualization: Bar Plot
+ggplot(main, aes(x = factor(pgfamstd_dummy))) +
+  geom_bar(fill = "lightblue", color = "black") +
+  labs(
+    title = "Distribution of Family Status",
+    x = "Family Status",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
 ## 4.8 Born In Germany
 ```{r}
 main <- main %>%
@@ -945,11 +1312,25 @@ ggplot(main, aes(x = factor(germborn, labels = c("Not Born in Germany", "Born in
 ```{r}
 # Create age and filter age range
 main <- main %>%
-  mutate(age = syear - ple0010_h) %>%
-  filter(!is.na(ple0010_h) & ple0010_h > 0) %>%
-  filter(age >= 25 & age <= 55) %>%
-  select(-ple0010_h)
-#Visualisation: Histogram
+  arrange(pid, syear) %>%  # Ensure data is sorted by pid and syear
+  group_by(pid) %>%
+  mutate(
+    # Impute `ple0010_h` using the closest valid value in the same group
+    ple0010_h = if_else(
+      is.na(ple0010_h),
+      ple0010_h[!is.na(ple0010_h)] + (syear - syear[!is.na(ple0010_h)]),  # Calculate from closest year
+      ple0010_h
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    age = syear - ple0010_h  # Calculate age based on imputed or existing `ple0010_h`
+  ) %>%
+  filter(!is.na(ple0010_h) & ple0010_h > 0) %>%  # Filter out invalid entries
+  filter(age >= 25 & age <= 55) %>%  # Keep only rows within the age range
+  select(-ple0010_h)  # Drop `ple0010_h` after processing
+
+# Visualisation: Histogram
 ggplot(main, aes(x = age)) +
   geom_histogram(binwidth = 5, fill = "gold", color = "black") +
   labs(
@@ -969,7 +1350,7 @@ main <- main %>%
     pid, syear, health, worr_health_categorical, worr_health_dummy, 
     migback, germborn, hospital_stay, smoking_dummy, nb_of_cigarettes, illnesses, 
     impaired_stairs, impaired_tiring_tasks, diet_categorical, diet_dummy, avg_grip, 
-    life_satisfaction, life_satisfaction_dummy, health_satisfaction, health_satisfaction_dummy, 
+    life_satisfaction, health_satisfaction,  
     height, weight, BMI, bmi_categorical, worr_job_categorical, worr_financial_categorical,
     worr_economic_categorical, worr_job_dummy, worr_financial_dummy, worr_economic_dummy, 
     tenure, employment_status_categorical, employed_dummy, net_income, work_time_weekly,
