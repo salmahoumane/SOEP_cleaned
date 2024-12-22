@@ -11,6 +11,7 @@ output:
     df_print: paged
 ---
 # Introduction
+We are examining the extent to which individuals’ subjective well-being can be predicted by objective factors that determine individual health decline and for which group this declaration bias is particularly large. And in that sense, which predictors (such as age, labor market status, personality traits and hand-grip strength) help improve predictions of individual health declines.
 
 This report documents the steps taken to preprocess and analyze the SOEP data for health-related outcomes: subjective and objective health measures, predictors, and control variables. The transformations include cleaning, imputing missing values, and deriving new variables.
 
@@ -22,7 +23,7 @@ This report documents the steps taken to preprocess and analyze the SOEP data fo
 
 ```{r}
 # Load required packages
-my_packages <- c("tidyverse", "haven", "openxlsx", "labelled", "dplyr", "lubridate","ggplot2")
+my_packages <- c("tidyverse", "haven", "openxlsx", "labelled", "dplyr", "lubridate","ggplot2","skimr")
 
 for (p in my_packages) {
   if (!require(p, character.only = TRUE)) {
@@ -42,6 +43,7 @@ main <- read_dta('/Users/salmahoumane/Documents/R/pl.dta') %>%
     "ple0004", "ple0005", "ple0095", "plh0182", "plh0171",
     "plh0042", "plh0033", "plh0032", "ple0010_h", "ple0006", "ple0007"
   )
+cat("Main dataset dimensions:", dim(main), "\n")
 ```
 
 ## 1.3 Merge with Other Datasets
@@ -50,12 +52,37 @@ main <- read_dta('/Users/salmahoumane/Documents/R/pl.dta') %>%
 # Merge with `pgen` dataset
 data_pgen <- read_dta('/Users/salmahoumane/Documents/R/pgen.dta') %>%
   select("pid", "syear", "pgerwzeit", "pgemplst", "pglabnet", "pgtatzeit", "pgexpue", "pgstib","pgfamstd")
+cat("PGEN dataset dimensions:", dim(data_pgen), "\n")
+main_before_merge <- dim(main)  # Store dimensions before merge
 main <- merge(main, data_pgen, by = c("pid", "syear"), all.x = TRUE)
+cat("After merging with pgen: Rows =", nrow(main), "Cols =", ncol(main), "\n")
+cat("Same number of rows then the main dataset with 7 new rows -> Merge successful")
+
+# Check for duplicate rows introduced during merge
+duplicates <- main %>%
+  group_by(pid, syear) %>%
+  summarise(count = n()) %>%
+  filter(count > 1)
+
+if (nrow(duplicates) > 0) {
+  cat("Warning: Duplicates detected after merging with pgen!\n")
+  print(duplicates)
+} else {
+  cat("No duplicates found after merging with pgen.\n")
+}
 
 # Merge with `ppathl` dataset
 data_ppathl <- read_dta('/Users/salmahoumane/Documents/R/ppathl.dta') %>%
   select("pid", "hid", "syear", "psample", "gebjahr", "sex", "migback", "germborn")
+cat("PPATHL dataset dimensions:", dim(data_ppathl), "\n")
+main_before_ppathl <- dim(main)  # Store dimensions before second merge
+
 main <- left_join(main, data_ppathl, by = c("pid", "syear"))
+cat("After merging with ppathl: Rows =", nrow(main), "Cols =", ncol(main), "\n")
+cat("Same number of rows then the main dataset with 6 new rows -> Merge successful")
+
+# Final snapshot of dimensions
+cat("Final dataset dimensions after all merges:", dim(main), "\n")
 ```
 
 ## 1.4 Main filtering: Analysis post 1999
@@ -205,7 +232,7 @@ main %>%
 
 # 3. Outcome Variables: Objective Health
 
-## 3.1 Grip Strength
+## 3.1 Grip Strength: it has the variable calculated twice for each hand for every other year between the years 2006-2018, we use gs01 which tells us about the dominant hand (1 is right, 2 is left, 3 is both) 
 
 ```{r}
 # Process grip strength data and merge with main
@@ -253,164 +280,394 @@ ggplot(main, aes(x = avg_grip)) +
 ## 3.2 Hospital Stay
 ```{r}
 # Create `hospital_stay` variable
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    ple0055_NA = sum(is.na(ple0055)),
+    ple0055_not_asked = sum(ple0055 %in% c(-8, -5), na.rm = TRUE),
+    ple0055_other_neg = sum(ple0055 < 0 & !(ple0055 %in% c(-8, -5)), na.rm = TRUE),
+    ple0056_NA = sum(is.na(ple0056)),
+    ple0056_not_asked = sum(ple0056 %in% c(-8, -5), na.rm = TRUE),
+    ple0056_other_neg = sum(ple0056 < 0 & !(ple0056 %in% c(-8, -5)), na.rm = TRUE)
+  )
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Values for ple0055 and ple0056 (Capping Lag/Lead to 2 Years)
 main <- main %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
   mutate(
-    # Handle ple0055 transformations
+    ple0055_flag = ifelse(ple0055 %in% c(-8, -5), 1, 0),  # Flag imputations
+    ple0056_flag = ifelse(ple0056 %in% c(-8, -5), 1, 0),
+    
     ple0055 = case_when(
-      ple0055 %in% c(-1, -3) ~ NA_real_,  # Drop rows where values indicate refusal (-1, -3)
-      ple0055 %in% c(-8, -5) & 
-        !is.na(lag(ple0055, order_by = syear)) & 
-        !is.na(lead(ple0055, order_by = syear)) ~ 
-        (lag(ple0055, order_by = syear) + lead(ple0055, order_by = syear)) / 2,  # Impute missing values
-      ple0055 >= 0 ~ ple0055,  # Keep valid non-negative values
-      TRUE ~ NA_real_  # Set all other cases to NA
+      ple0055 %in% c(-8, -5) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(ple0055), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(ple0055), NA_real_)
+        coalesce(lag_val, lead_val)
+      },
+      TRUE ~ ple0055
     ),
-    # Handle ple0056 transformations
     ple0056 = case_when(
-      ple0056 %in% c(-1, -3) ~ NA_real_,  # Drop rows where values indicate refusal (-1, -3)
-      ple0056 %in% c(-8, -5) & 
-        !is.na(lag(ple0056, order_by = syear)) & 
-        !is.na(lead(ple0056, order_by = syear)) ~ 
-        (lag(ple0056, order_by = syear) + lead(ple0056, order_by = syear)) / 2,  # Impute missing values
-      ple0056 >= 0 ~ ple0056,  # Keep valid non-negative values
-      TRUE ~ NA_real_  # Set all other cases to NA
-    )
+      ple0056 %in% c(-8, -5) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(ple0056), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(ple0056), NA_real_)
+        coalesce(lag_val, lead_val)
+      },
+      TRUE ~ ple0056
+    ),
+    
+    imputed_flag = ifelse(ple0055_flag == 1 | ple0056_flag == 1, 1, 0)  # Combined flag
   ) %>%
-  # Drop rows where either ple0055 or ple0056 is NA
+  ungroup()
+
+# Step 3: Filter Valid Rows and Calculate Hospital Stay
+main <- main %>%
   filter(!is.na(ple0055) & !is.na(ple0056)) %>%
-  # Ensure both ple0055 and ple0056 are non-negative before calculation
-  mutate(
-    ple0055 = if_else(ple0055 < 0, NA_real_, ple0055),
-    ple0056 = if_else(ple0056 < 0, NA_real_, ple0056),
-    hospital_stay = ple0055 + ple0056  # Calculate hospital stay
-  ) %>%
-  # Drop rows with negative hospital_stay
-  filter(hospital_stay >= 0) %>%
-  # Drop original columns
-  select(-ple0055, -ple0056)
-#Visualisation: Histogram
+  mutate(hospital_stay = ple0055 + ple0056) %>%
+  filter(hospital_stay >= 0)
+
+# Step 4: Imputed and Non-Imputed Statistics
+# Imputed Rows
+imputed_stats <- main %>%
+  filter(imputed_flag == 1) %>%
+  summarise(
+    Mean = mean(hospital_stay, na.rm = TRUE),
+    Median = median(hospital_stay, na.rm = TRUE),
+    Q1 = quantile(hospital_stay, 0.25, na.rm = TRUE),
+    Q3 = quantile(hospital_stay, 0.75, na.rm = TRUE),
+    Min = min(hospital_stay, na.rm = TRUE),
+    Max = max(hospital_stay, na.rm = TRUE),
+    Count = n()
+  )
+
+# Non-Imputed Rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag == 0) %>%
+  summarise(
+    Mean = mean(hospital_stay, na.rm = TRUE),
+    Median = median(hospital_stay, na.rm = TRUE),
+    Q1 = quantile(hospital_stay, 0.25, na.rm = TRUE),
+    Q3 = quantile(hospital_stay, 0.75, na.rm = TRUE),
+    Min = min(hospital_stay, na.rm = TRUE),
+    Max = max(hospital_stay, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Recheck Total Imputed Counts
+imputation_counts <- main %>%
+  summarise(
+    Total_Imputed_Rows = sum(imputed_flag),
+    Total_Rows = n()
+  )
+print("Imputation Counts:")
+print(imputation_counts)
+
+# Step 6: Visualizations
+# All rows
 ggplot(main, aes(x = hospital_stay)) +
-  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7) +
-  labs(
-    title = "Distribution of Hospital Stays",
-    x = "Number of Days in Hospital",
-    y = "Count"
-  ) +
-  theme_minimal()
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(title = "Hospital Stays - All Rows", x = "Days in Hospital", y = "Count")
+
+# Imputed rows
+ggplot(main %>% filter(imputed_flag == 1), aes(x = hospital_stay)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black") +
+  labs(title = "Hospital Stays - Imputed Rows", x = "Days in Hospital", y = "Count")
+
+# Non-Imputed rows
+ggplot(main %>% filter(imputed_flag == 0), aes(x = hospital_stay)) +
+  geom_histogram(binwidth = 1, fill = "green", color = "black") +
+  labs(title = "Hospital Stays - Non-Imputed Rows", x = "Days in Hospital", y = "Count")
 ```
+
 
 ## 3.3 Impairement Variables
 ```{r}
 # Create impaired_stairs and impaired_tiring_tasks
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    ple0004_NA = sum(is.na(ple0004)),
+    ple0004_not_asked = sum(ple0004 %in% c(-5, -8), na.rm = TRUE),
+    ple0004_other_neg = sum(ple0004 < 0 & !(ple0004 %in% c(-5, -8)), na.rm = TRUE),
+    ple0005_NA = sum(is.na(ple0005)),
+    ple0005_not_asked = sum(ple0005 %in% c(-5, -8), na.rm = TRUE),
+    ple0005_other_neg = sum(ple0005 < 0 & !(ple0005 %in% c(-5, -8)), na.rm = TRUE)
+  )
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute ple0004 and ple0005 with 2-Year Cap
 main <- main %>%
+  arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(
-    # Handle ple0004 transformations
-    ple0004 = ifelse(ple0004 < -2, NA_real_, ple0004),
-    ple0004 = if_else(
-      syear %in% 1999:2001 & is.na(ple0004),
-      ple0004[syear == 2002][1],  # Use the 2002 value if it exists
-      ple0004
-     ),
-    ple0004 = ifelse(
-      ple0004 %in% c(-5, -8) & !is.na(lag(ple0004, order_by = syear)) & !is.na(lead(ple0004, order_by = syear)),
-      (lag(ple0004, order_by = syear) + lead(ple0004, order_by = syear)) / 2, ple0004
+    ple0004_imputed = ifelse(ple0004 %in% c(-5, -8), 1, 0),
+    ple0005_imputed = ifelse(ple0005 %in% c(-5, -8), 1, 0),
+    imputed_flag = ifelse(ple0004_imputed == 1 | ple0005_imputed == 1, 1, 0),
+
+    ple0004 = case_when(
+      ple0004 < -2 ~ NA_real_,
+      ple0004 %in% c(-5, -8) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(ple0004), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(ple0004), NA_real_)
+        coalesce(lag_val, lead_val)
+      },
+      TRUE ~ ple0004
     ),
-    ple0004 = ifelse(is.na(ple0004), 3, ple0004),  # Default unresolved NA to 3 ("no impairment")
-    
-    # Handle ple0005 transformations
-    ple0005 = ifelse(ple0005 < -2, NA_real_, ple0005),
-    ple0005 = ifelse(
-      ple0005 == -1 & !is.na(lag(ple0005, order_by = syear)) & !is.na(lead(ple0005, order_by = syear)),
-      (lag(ple0005, order_by = syear) + lead(ple0005, order_by = syear)) / 2, ple0005
-    ),
-    ple0005 = ifelse(is.na(ple0005), 3, ple0005)  # Default unresolved NA to 3 ("no impairment")
-  ) %>%
-  ungroup() %>% 
-  mutate(
-    # Calculate impaired_stairs
-    impaired_stairs = case_when(
-      ple0004 %in% c(1, 2) ~ 1,  # Impaired
-      ple0004 == 3 ~ 0        # Not impaired
-    ),
-    
-    # Calculate impaired_tiring_tasks
-    impaired_tiring_tasks = case_when(
-      ple0005 %in% c(1, 2) ~ 1,  # Impaired
-      ple0005 == 3 ~ 0         # Not impaired
+    ple0005 = case_when(
+      ple0005 < -2 ~ NA_real_,
+      ple0005 %in% c(-5, -8) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(ple0005), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(ple0005), NA_real_)
+        coalesce(lag_val, lead_val)
+      },
+      TRUE ~ ple0005
     )
   ) %>%
-  # Drop rows where BOTH ple0004 and ple0005 are NA
-  filter(!is.na(impaired_tiring_tasks) & !is.na(impaired_stairs))
+  ungroup() %>%
+  mutate(
+    impaired_stairs = ifelse(ple0004 %in% c(1, 2), 1, 0),
+    impaired_tiring_tasks = ifelse(ple0005 %in% c(1, 2), 1, 0)
+  )
 
-#Visusalition: Bar plots- stairs
+# Step 3: Track Missing Categories After Imputation
+missing_breakdown_after <- main %>%
+  summarise(
+    ple0004_NA = sum(is.na(ple0004)),
+    ple0005_NA = sum(is.na(ple0005))
+  )
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 4: Descriptive Statistics
+# Descriptive statistics for imputed rows
+imputed_stats <- main %>%
+  filter(imputed_flag == 1) %>%
+  summarise(
+    Impaired_Stairs_Mean = mean(impaired_stairs, na.rm = TRUE),
+    Impaired_Stairs_Median = median(impaired_stairs, na.rm = TRUE),
+    Impaired_Stairs_Q1 = quantile(impaired_stairs, 0.25, na.rm = TRUE),
+    Impaired_Stairs_Q3 = quantile(impaired_stairs, 0.75, na.rm = TRUE),
+    Impaired_Tasks_Mean = mean(impaired_tiring_tasks, na.rm = TRUE),
+    Impaired_Tasks_Median = median(impaired_tiring_tasks, na.rm = TRUE),
+    Impaired_Tasks_Q1 = quantile(impaired_tiring_tasks, 0.25, na.rm = TRUE),
+    Impaired_Tasks_Q3 = quantile(impaired_tiring_tasks, 0.75, na.rm = TRUE),
+    Count = n()
+  )
+
+# Descriptive statistics for non-imputed rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag == 0) %>%
+  summarise(
+    Impaired_Stairs_Mean = mean(impaired_stairs, na.rm = TRUE),
+    Impaired_Stairs_Median = median(impaired_stairs, na.rm = TRUE),
+    Impaired_Stairs_Q1 = quantile(impaired_stairs, 0.25, na.rm = TRUE),
+    Impaired_Stairs_Q3 = quantile(impaired_stairs, 0.75, na.rm = TRUE),
+    Impaired_Tasks_Mean = mean(impaired_tiring_tasks, na.rm = TRUE),
+    Impaired_Tasks_Median = median(impaired_tiring_tasks, na.rm = TRUE),
+    Impaired_Tasks_Q1 = quantile(impaired_tiring_tasks, 0.25, na.rm = TRUE),
+    Impaired_Tasks_Q3 = quantile(impaired_tiring_tasks, 0.75, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Visualizations
+
+# Impaired Stairs
+# All rows
 ggplot(main, aes(x = factor(impaired_stairs))) +
   geom_bar(fill = "skyblue", color = "black") +
   labs(
-    title = "Distribution of Impaired Stairs",
-    x = "Impairment in Climbing Stairs (1 = Impaired, 0 = Not Impaired)",
+    title = "Impaired Stairs - All Rows",
+    x = "Impaired Stairs (1 = Yes, 0 = No)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Imputed rows only
+ggplot(main %>% filter(imputed_flag == 1), aes(x = factor(impaired_stairs))) +
+  geom_bar(fill = "orange", color = "black") +
+  labs(
+    title = "Impaired Stairs - Imputed Rows",
+    x = "Impaired Stairs (1 = Yes, 0 = No)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-imputed rows only
+ggplot(main %>% filter(imputed_flag == 0), aes(x = factor(impaired_stairs))) +
+  geom_bar(fill = "green", color = "black") +
+  labs(
+    title = "Impaired Stairs - Non-Imputed Rows",
+    x = "Impaired Stairs (1 = Yes, 0 = No)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Impaired Tiring Tasks
+# All rows
+ggplot(main, aes(x = factor(impaired_tiring_tasks))) +
+  geom_bar(fill = "coral", color = "black") +
+  labs(
+    title = "Impaired Tiring Tasks - All Rows",
+    x = "Impaired Tasks (1 = Yes, 0 = No)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Imputed rows only
+ggplot(main %>% filter(imputed_flag == 1), aes(x = factor(impaired_tiring_tasks))) +
+  geom_bar(fill = "orange", color = "black") +
+  labs(
+    title = "Impaired Tiring Tasks - Imputed Rows",
+    x = "Impaired Tasks (1 = Yes, 0 = No)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-imputed rows only
+ggplot(main %>% filter(imputed_flag == 0), aes(x = factor(impaired_tiring_tasks))) +
+  geom_bar(fill = "green", color = "black") +
+  labs(
+    title = "Impaired Tiring Tasks - Non-Imputed Rows",
+    x = "Impaired Tasks (1 = Yes, 0 = No)",
     y = "Count"
   ) +
   theme_minimal()
 ```
 
-## 3.4. Illnesses: Special Potential Specification
+
+## 3.4. Illnesses: Special Potential Specification because surveyed 2011 and above, every other year 
 ```{r}
 # Create illnesses variable
 illness_vars <- c("ple0011", "ple0012", "ple0013", "ple0014", "ple0015", 
                   "ple0016", "ple0017", "ple0018", "ple0019", "ple0020", 
                   "ple0021", "ple0022", "ple0023")
 
-main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
-  group_by(pid) %>%
-  mutate(across(
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(across(
     all_of(illness_vars),
-    ~ case_when(
-      . %in% c(-8, -5) ~ {  # Impute -8 and -5 using the closest year's value
-        temp <- .
-        for (i in seq_along(temp)) {
-          if (temp[i] %in% c(-8, -5)) {
-            lag_val <- lag(temp, default = NA_real_, order_by = syear)[i]
-            lead_val <- lead(temp, default = NA_real_, order_by = syear)[i]
-            temp[i] <- if (!is.na(lag_val)) lag_val else lead_val
-          }
-        }
-        temp
-      },
-      . == -2 ~ 0,  # Transform -2 into 0
-      TRUE ~ .  # Keep all other valid values
+    list(
+      NA_count = function(x) sum(is.na(x)),                       # Count NAs
+      not_asked = function(x) sum(x %in% c(-8, -5), na.rm = TRUE), # Count -8, -5
+      other_neg = function(x) sum(x < 0 & !(x %in% c(-8, -5)), na.rm = TRUE) # Count other negatives
     )
-  )) %>%
-  ungroup() %>%
+  ))
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Illness Variables with Max 2-Year Lag/Lead
+main <- main %>%
   arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(across(
     all_of(illness_vars),
-    ~ if_else(is.na(.), lag(., order_by = syear), .)
-  )) %>%
-  mutate(across(
-    all_of(illness_vars),
-    ~ if_else(is.na(.), lead(., order_by = syear), .)
+    ~ case_when(
+      . %in% c(-8, -5) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(., order_by = syear), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(., order_by = syear), NA_real_)
+        if_else(!is.na(lag_val) & !is.na(lead_val), (lag_val + lead_val) / 2, coalesce(lag_val, lead_val))
+      },
+      . == -2 ~ 0,  # Set -2 to 0
+      TRUE ~ .  # Keep valid values
+    ),
+    .names = "{.col}_imputed"
   )) %>%
   ungroup() %>%
-  mutate(across(
-    all_of(illness_vars),
-    ~ if_else(. < 0, NA_real_, .)  # Replace remaining negative values with NA
-  )) %>%
+  mutate(across(all_of(illness_vars), ~ if_else(. < 0, NA_real_, .))) %>%
   mutate(
-    illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE)  # Calculate the sum of illnesses
-  )
-# Ensure illnesses is rounded to integers
-main <- main %>%
+    illnesses = rowSums(across(all_of(illness_vars)), na.rm = TRUE),
+    imputed_flag = if_else(rowSums(across(ends_with("_imputed"), ~ . %in% c(-8, -5))) > 0, 1, 0)
+  ) %>%
   mutate(illnesses = round(illnesses))
 
-# Visualisation: Histogram with integer bins
+# Step 3: Breakdown After Imputation
+missing_breakdown_after <- main %>%
+  summarise(across(
+    all_of(illness_vars),
+    ~ sum(is.na(.)), .names = "{.col}_NA_after"
+  ))
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 4: Descriptive Statistics for Imputed and Non-Imputed Rows
+# Imputed Rows
+imputed_stats <- main %>%
+  filter(imputed_flag == 1) %>%
+  summarise(
+    Mean_Illnesses = mean(illnesses, na.rm = TRUE),
+    Median_Illnesses = median(illnesses, na.rm = TRUE),
+    Q1 = quantile(illnesses, 0.25, na.rm = TRUE),
+    Q3 = quantile(illnesses, 0.75, na.rm = TRUE),
+    Min = min(illnesses, na.rm = TRUE),
+    Max = max(illnesses, na.rm = TRUE),
+    Count = n()
+  )
+
+# Non-Imputed Rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag == 0) %>%
+  summarise(
+    Mean_Illnesses = mean(illnesses, na.rm = TRUE),
+    Median_Illnesses = median(illnesses, na.rm = TRUE),
+    Q1 = quantile(illnesses, 0.25, na.rm = TRUE),
+    Q3 = quantile(illnesses, 0.75, na.rm = TRUE),
+    Min = min(illnesses, na.rm = TRUE),
+    Max = max(illnesses, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Visualizations
+# All Rows
 ggplot(main, aes(x = illnesses)) +
-  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7, center = 0.5) +
-  scale_x_continuous(breaks = seq(0, max(main$illnesses, na.rm = TRUE), by = 1)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
   labs(
-    title = "Distribution of Illness Counts",
+    title = "Distribution of Illness Counts - All Rows",
+    x = "Number of Illnesses",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 1), aes(x = illnesses)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black") +
+  labs(
+    title = "Distribution of Illness Counts - Imputed Rows",
+    x = "Number of Illnesses",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 0), aes(x = illnesses)) +
+  geom_histogram(binwidth = 1, fill = "green", color = "black") +
+  labs(
+    title = "Distribution of Illness Counts - Non-Imputed Rows",
     x = "Number of Illnesses",
     y = "Count"
   ) +
@@ -418,68 +675,155 @@ ggplot(main, aes(x = illnesses)) +
 ```
 
 
-
 ## 3.2 Predictors
 ## 3.2.1 Life Satisfaction and Health Satisfaction
 ```{r}
 # Create life_satisfaction and health_satisfaction variables
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    plh0182_NA = sum(is.na(plh0182)),
+    plh0182_not_asked = sum(plh0182 %in% c(-8, -5), na.rm = TRUE),
+    plh0182_other_neg = sum(plh0182 < 0 & !(plh0182 %in% c(-8, -5)), na.rm = TRUE),
+    plh0171_NA = sum(is.na(plh0171)),
+    plh0171_not_asked = sum(plh0171 %in% c(-8, -5), na.rm = TRUE),
+    plh0171_other_neg = sum(plh0171 < 0 & !(plh0171 %in% c(-8, -5)), na.rm = TRUE)
+  )
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Values for plh0182 and plh0171 with Max 2-Year Lag/Lead
 main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  arrange(pid, syear) %>%  # Ensure proper sorting
   group_by(pid) %>%
   mutate(
-    # Impute for plh0182
-    plh0182 = ifelse(plh0182 %in% c(-5, -8), NA_real_, plh0182),  # Replace -5 and -8 with NA
-    plh0182 = {
-      temp <- plh0182
-      for (i in seq_len(n())) {
-        # Check for missing values and use nearest available value from lag or lead
-        if (is.na(temp[i])) {
-          lag_val <- lag(temp, default = NA_real_, order_by = syear)[i]
-          lead_val <- lead(temp, default = NA_real_, order_by = syear)[i]
-          temp[i] <- if (!is.na(lag_val)) lag_val else lead_val
-        }
-      }
-      temp
-    },
-    # Impute for plh0171
-    plh0171 = ifelse(plh0171 %in% c(-5, -8), NA_real_, plh0171),  # Replace -5 and -8 with NA
-    plh0171 = {
-      temp <- plh0171
-      for (i in seq_len(n())) {
-        # Check for missing values and use nearest available value from lag or lead
-        if (is.na(temp[i])) {
-          lag_val <- lag(temp, default = NA_real_, order_by = syear)[i]
-          lead_val <- lead(temp, default = NA_real_, order_by = syear)[i]
-          temp[i] <- if (!is.na(lag_val)) lag_val else lead_val
-        }
-      }
-      temp
-    }
+    # Flag rows that are imputed
+    imputed_flag_life = if_else(plh0182 %in% c(-5, -8) | is.na(plh0182), 1, 0),
+    imputed_flag_health = if_else(plh0171 %in% c(-5, -8) | is.na(plh0171), 1, 0),
+
+    # Replace -5 and -8 with NA
+    plh0182 = case_when(plh0182 %in% c(-5, -8) ~ NA_real_, TRUE ~ plh0182),
+    plh0171 = case_when(plh0171 %in% c(-5, -8) ~ NA_real_, TRUE ~ plh0171),
+
+    # Impute plh0182 (life satisfaction)
+    life_satisfaction = if_else(
+      is.na(plh0182),
+      coalesce(
+        if_else(syear - lag(syear) <= 2 & !is.na(lag(plh0182)), lag(plh0182), NA_real_),
+        if_else(lead(syear) - syear <= 2 & !is.na(lead(plh0182)), lead(plh0182), NA_real_)
+      ),
+      plh0182
+    ),
+
+    # Impute plh0171 (health satisfaction)
+    health_satisfaction = if_else(
+      is.na(plh0171),
+      coalesce(
+        if_else(syear - lag(syear) <= 2 & !is.na(lag(plh0171)), lag(plh0171), NA_real_),
+        if_else(lead(syear) - syear <= 2 & !is.na(lead(plh0171)), lead(plh0171), NA_real_)
+      ),
+      plh0171
+    )
   ) %>%
-  ungroup() %>%
-  filter(plh0182 >= 0 & plh0182 <= 10) %>%  # Filter valid range for life satisfaction
-  mutate(
-    life_satisfaction = plh0182
-  ) %>%
-  filter(plh0171 >= 0 & plh0171 <= 10) %>%  # Filter valid range for health satisfaction
-  mutate(
-    health_satisfaction = plh0171
+  ungroup()
+
+# Step 3: Breakdown After Imputation
+missing_breakdown_after <- main %>%
+  summarise(
+    life_satisfaction_NA = sum(is.na(life_satisfaction)),
+    health_satisfaction_NA = sum(is.na(health_satisfaction))
   )
-# Visualisation: Bar plot- Life Satisfaction
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 4: Descriptive Statistics
+# Imputed Rows
+imputed_stats <- main %>%
+  filter(imputed_flag_life == 1 | imputed_flag_health == 1) %>%
+  summarise(
+    Life_Satisfaction_Mean = mean(life_satisfaction, na.rm = TRUE),
+    Life_Satisfaction_Median = median(life_satisfaction, na.rm = TRUE),
+    Health_Satisfaction_Mean = mean(health_satisfaction, na.rm = TRUE),
+    Health_Satisfaction_Median = median(health_satisfaction, na.rm = TRUE),
+    Count = n()
+  )
+
+# Non-Imputed Rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag_life == 0 & imputed_flag_health == 0) %>%
+  summarise(
+    Life_Satisfaction_Mean = mean(life_satisfaction, na.rm = TRUE),
+    Life_Satisfaction_Median = median(life_satisfaction, na.rm = TRUE),
+    Health_Satisfaction_Mean = mean(health_satisfaction, na.rm = TRUE),
+    Health_Satisfaction_Median = median(health_satisfaction, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Visualizations
+# All Rows: Life Satisfaction
 ggplot(main, aes(x = factor(life_satisfaction))) +
   geom_bar(fill = "skyblue", color = "black") +
   labs(
-    title = "Distribution of Life Satisfaction",
-    x = "Life Satisfaction (0 = Lowest, 10 = Highest)",
+    title = "Life Satisfaction - All Rows",
+    x = "Life Satisfaction (0-10)",
     y = "Count"
   ) +
   theme_minimal()
-# Visualisation: Bar plot- Health Satisfaction
+
+# Imputed Rows Only
+ggplot(main %>% filter(imputed_flag_life == 1), aes(x = factor(life_satisfaction))) +
+  geom_bar(fill = "orange", color = "black") +
+  labs(
+    title = "Life Satisfaction - Imputed Rows",
+    x = "Life Satisfaction (0-10)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows Only
+ggplot(main %>% filter(imputed_flag_life == 0), aes(x = factor(life_satisfaction))) +
+  geom_bar(fill = "green", color = "black") +
+  labs(
+    title = "Life Satisfaction - Non-Imputed Rows",
+    x = "Life Satisfaction (0-10)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# All Rows: Health Satisfaction
 ggplot(main, aes(x = factor(health_satisfaction))) +
   geom_bar(fill = "coral", color = "black") +
   labs(
-    title = "Distribution of Health Satisfaction",
-    x = "Health Satisfaction (0 = Lowest, 10 = Highest)",
+    title = "Health Satisfaction - All Rows",
+    x = "Health Satisfaction (0-10)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Imputed Rows Only
+ggplot(main %>% filter(imputed_flag_health == 1), aes(x = factor(health_satisfaction))) +
+  geom_bar(fill = "orange", color = "black") +
+  labs(
+    title = "Health Satisfaction - Imputed Rows",
+    x = "Health Satisfaction (0-10)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows Only
+ggplot(main %>% filter(imputed_flag_health == 0), aes(x = factor(health_satisfaction))) +
+  geom_bar(fill = "green", color = "black") +
+  labs(
+    title = "Health Satisfaction - Non-Imputed Rows",
+    x = "Health Satisfaction (0-10)",
     y = "Count"
   ) +
   theme_minimal()
@@ -488,77 +832,162 @@ ggplot(main, aes(x = factor(health_satisfaction))) +
 ## 3.2.2 BMI
 ```{r}
 # Process height and weight
-main <- main %>%
-  mutate(
-    # Rename and handle outliers
-    height = case_when(
-      ple0006 > 245 ~ NA_real_,  # Outliers above 245 cm are set to NA
-      ple0006 > 0 ~ ple0006,     # Valid values
-      ple0006 <= 0 ~ NA_real_,   # Ensure all non-positive values are set to NA
-      TRUE ~ NA_real_            # Other invalid values to NA
-    )
-  ) %>%
-  group_by(pid) %>%
-  mutate(
-    # Impute missing `height` using the first non-NA value within the same `pid`
-    height = if_else(
-      is.na(height),
-      last(na.omit(height), default = NA_real_),  # Use the latest valid value or keep NA if none exist
-      height
-    )
-  ) %>%
-  ungroup() %>%
-  drop_na(height)  # Drop rows where `height` remains NA
-
-main <- main %>%
-  mutate(
-    # Rename and handle outliers
-    weight = case_when(
-      ple0007 > 0 ~ ple0007,     # Valid values
-      TRUE ~ NA_real_            # Other invalid values to NA
-    )
-  ) %>%
-  group_by(pid) %>%
-  mutate(
-    # Impute missing `weight` using average of previous and next years if both are non-NA
-    weight = if_else(
-      is.na(weight) & !is.na(lag(weight, order_by = syear)) & !is.na(lead(weight, order_by = syear)),
-      (lag(weight, order_by = syear) + lead(weight, order_by = syear)) / 2,
-      weight
-    )
-  ) %>%
-  ungroup() %>%
-  filter(!is.na(weight)) %>%  # Drop rows where `weight` remains NA
-  select(-ple0007)  # Drop the original `ple0007` column
-
-#Create BMI using height and weight and BMI categories 
-main <- main %>%
-  mutate(
-    BMI = weight / ((height / 100) ^ 2)  # Convert height to meters and calculate BMI
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    height_NA = sum(is.na(ple0006)),
+    weight_NA = sum(is.na(ple0007)),
+    height_invalid = sum(ple0006 > 245 | ple0006 <= 0, na.rm = TRUE),
+    weight_invalid = sum(ple0007 <= 0, na.rm = TRUE)
   )
 
-# Create BMI categorical variable
+print("Breakdown of missing and invalid values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Process and Impute Height with Lag/Lead (<= 2 years)
+main <- main %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
+  mutate(
+    # Track imputation flag for height
+    height_imputed = if_else(ple0006 > 245 | ple0006 <= 0 | is.na(ple0006), 1, 0),
+    # Handle valid height and imputation
+    height = case_when(
+      ple0006 > 245 ~ NA_real_,
+      ple0006 > 0 ~ ple0006,
+      TRUE ~ NA_real_
+    ),
+    height = case_when(
+      is.na(height) & syear - lag(syear) <= 2 ~ lag(height),
+      is.na(height) & lead(syear) - syear <= 2 ~ lead(height),
+      TRUE ~ height
+    )
+  ) %>%
+  ungroup()
+
+# Step 3: Process and Impute Weight with Lag/Lead (<= 2 years)
+main <- main %>%
+  arrange(pid, syear) %>%
+  group_by(pid) %>%
+  mutate(
+    # Track imputation flag for weight
+    weight_imputed = if_else(ple0007 <= 0 | is.na(ple0007), 1, 0),
+    # Handle valid weight and imputation
+    weight = case_when(
+      ple0007 > 0 ~ ple0007,
+      TRUE ~ NA_real_
+    ),
+    weight = case_when(
+      is.na(weight) & syear - lag(syear) <= 2 ~ lag(weight),
+      is.na(weight) & lead(syear) - syear <= 2 ~ lead(weight),
+      TRUE ~ weight
+    )
+  ) %>%
+  ungroup()
+
+# Step 4: Track Missing Categories After Imputation
+missing_breakdown_after <- main %>%
+  summarise(
+    height_NA = sum(is.na(height)),
+    weight_NA = sum(is.na(weight)),
+    height_imputed = sum(height_imputed),
+    weight_imputed = sum(weight_imputed)
+  )
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 5: Calculate BMI and Create Categorical Variable
 main <- main %>%
   mutate(
+    BMI = weight / ((height / 100) ^ 2),  # Calculate BMI
     bmi_categorical = case_when(
       BMI < 18.5 ~ "Underweight",
       BMI >= 18.5 & BMI < 25 ~ "Normal weight",
       BMI >= 25 & BMI < 30 ~ "Overweight",
       BMI >= 30 ~ "Obese",
-      TRUE ~ NA_character_  # Catch any unexpected cases
-    )
-  ) %>%
-  mutate(
+      TRUE ~ NA_character_
+    ),
     bmi_categorical = factor(
       bmi_categorical,
       levels = c("Underweight", "Normal weight", "Overweight", "Obese")
     )
   )
-#Visusalisation: Histogram
+
+# Step 6: Descriptive Statistics for Imputed and Non-Imputed Rows
+# Descriptive stats for all rows
+all_stats <- main %>%
+  summarise(
+    Mean = mean(BMI, na.rm = TRUE),
+    Median = median(BMI, na.rm = TRUE),
+    Q1 = quantile(BMI, 0.25, na.rm = TRUE),
+    Q3 = quantile(BMI, 0.75, na.rm = TRUE),
+    Min = min(BMI, na.rm = TRUE),
+    Max = max(BMI, na.rm = TRUE),
+    Count = n()
+  )
+
+# Descriptive stats for imputed rows
+imputed_stats <- main %>%
+  filter(height_imputed == 1 | weight_imputed == 1) %>%
+  summarise(
+    Mean = mean(BMI, na.rm = TRUE),
+    Median = median(BMI, na.rm = TRUE),
+    Q1 = quantile(BMI, 0.25, na.rm = TRUE),
+    Q3 = quantile(BMI, 0.75, na.rm = TRUE),
+    Min = min(BMI, na.rm = TRUE),
+    Max = max(BMI, na.rm = TRUE),
+    Count = n()
+  )
+
+# Descriptive stats for non-imputed rows
+non_imputed_stats <- main %>%
+  filter(height_imputed == 0 & weight_imputed == 0) %>%
+  summarise(
+    Mean = mean(BMI, na.rm = TRUE),
+    Median = median(BMI, na.rm = TRUE),
+    Q1 = quantile(BMI, 0.25, na.rm = TRUE),
+    Q3 = quantile(BMI, 0.75, na.rm = TRUE),
+    Min = min(BMI, na.rm = TRUE),
+    Max = max(BMI, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for All Rows:")
+print(all_stats)
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 7: Visualizations
+# Histogram for all rows
 ggplot(main, aes(x = BMI)) +
   geom_histogram(binwidth = 1, fill = "purple", color = "black", alpha = 0.7) +
   labs(
-    title = "Distribution of BMI",
+    title = "BMI Distribution - All Rows",
+    x = "BMI",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Histogram for imputed rows
+ggplot(main %>% filter(height_imputed == 1 | weight_imputed == 1), aes(x = BMI)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black", alpha = 0.7) +
+  labs(
+    title = "BMI Distribution - Imputed Rows",
+    x = "BMI",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Histogram for non-imputed rows
+ggplot(main %>% filter(height_imputed == 0 & weight_imputed == 0), aes(x = BMI)) +
+  geom_histogram(binwidth = 1, fill = "green", color = "black", alpha = 0.7) +
+  labs(
+    title = "BMI Distribution - Non-Imputed Rows",
     x = "BMI",
     y = "Count"
   ) +
@@ -566,127 +995,202 @@ ggplot(main, aes(x = BMI)) +
 
 ```
 
+
 ## 3.2.3 Smoking and Number of Cigarettes
 ```{r}
 # Create `smoking_dummy`
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    ple0081_h_NA = sum(is.na(ple0081_h)),
+    ple0081_h_invalid = sum(ple0081_h %in% c(-5, -8), na.rm = TRUE),
+    ple0086_v4_NA = sum(is.na(ple0086_v4)),
+    ple0086_v4_invalid = sum(ple0086_v4 %in% c(-5, -8), na.rm = TRUE)
+  )
+
+print("Breakdown of missing and invalid values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Smoking Status (ple0081_h) with Lag and Lead (Max 2 Years)
 main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(
-    # Impute -5 or -8 using dynamic lag and lead
-    ple0081_h = ifelse(ple0081_h %in% c(-5, -8), NA_real_, ple0081_h),
-    ple0081_h = {
-      temp <- ple0081_h
-      for (i in seq_len(n())) {
-        if (is.na(temp[i])) {
-          # Check lag and lead values iteratively
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
-
-          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
-          } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
-          } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
-          }
-        }
-      }
-      temp
-    }
-  ) %>%
-  ungroup() %>%
-  # Transform ple0081_h
-  mutate(
+    smoking_imputed = if_else(ple0081_h %in% c(-5, -8), 1, 0),
     ple0081_h = case_when(
+      ple0081_h %in% c(-5, -8) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(ple0081_h), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(ple0081_h), NA_real_)
+        if_else(!is.na(lag_val) & !is.na(lead_val), (lag_val + lead_val) / 2, coalesce(lag_val, lead_val))
+      },
       ple0081_h == -2 ~ 2,  # Treat -2 as "no" (2)
-      ple0081_h > 0 ~ ple0081_h,  # Keep valid values (1 = yes, 2 = no)
-      TRUE ~ NA_real_  # Set all other cases to NA
-    )
+      ple0081_h > 0 ~ ple0081_h,
+      TRUE ~ NA_real_
+    ),
+    smoking_dummy = if_else(ple0081_h == 1, 1, 0)  # Create smoking dummy (1 = Smoker, 0 = Non-Smoker)
   ) %>%
-  filter(!is.na(ple0081_h)) %>%  # Drop rows where ple0081_h remains NA
-  # Create smoking_dummy
-  mutate(smoking_dummy = if_else(ple0081_h == 1, 1, 0))  # 1 for yes, 0 for no
+  ungroup()
 
-# Creating number of cigarettes
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    ple0086_v4_NA = sum(is.na(ple0086_v4)),
+    ple0086_v4_invalid = sum(ple0086_v4 %in% c(-5, -8), na.rm = TRUE),
+    ple0086_v4_negative = sum(ple0086_v4 < 0, na.rm = TRUE)
+  )
+
+print("Breakdown of invalid values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Number of Cigarettes with Lag/Lead (Max 2 Years)
 main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(
-    # Impute -5 or -8 using dynamic lag and lead
-    ple0086_v4 = ifelse(ple0086_v4 %in% c(-5, -8), NA_real_, ple0086_v4),
-    ple0086_v4 = {
-      temp <- ple0086_v4
-      for (i in seq_len(n())) {
-        if (is.na(temp[i])) {
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
-
-          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
-          } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
-          } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
-          }
-        }
-      }
-      temp
-    }
-  ) %>%
-  ungroup() %>%
-  mutate(
-    # Handle ple0086_v4 values
+    cigarettes_imputed = if_else(ple0086_v4 %in% c(-5, -8), 1, 0),  # Flag imputed rows
     ple0086_v4 = case_when(
+      ple0086_v4 %in% c(-5, -8) ~ {
+        # Impute using lag and lead within 2 years
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(ple0086_v4), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(ple0086_v4), NA_real_)
+        valid_val <- if_else(!is.na(lag_val) & !is.na(lead_val), (lag_val + lead_val) / 2, coalesce(lag_val, lead_val))
+        if_else(valid_val >= 0, valid_val, NA_real_)  # Ensure valid positive values only
+      },
       ple0086_v4 == -2 ~ 0,  # Treat -2 as 0
-      ple0086_v4 >= 0 ~ ple0086_v4,  # Keep valid values
-      TRUE ~ NA_real_  # Set invalid values to NA
-    )
+      ple0086_v4 >= 0 ~ ple0086_v4,  # Keep valid positive values
+      TRUE ~ NA_real_  # Set other invalid cases to NA
+    ),
+    nb_of_cigarettes = ple0086_v4
   ) %>%
-  filter(!is.na(ple0086_v4)) %>%  # Drop rows where ple0086_v4 remains NA
-  # Create nb_of_cigarettes
-  mutate(nb_of_cigarettes = ple0086_v4)
+  ungroup()
 
-#Visusalition: Pie Chart
-main %>%
-  group_by(smoking_dummy) %>%
-  summarize(count = n()) %>%
-  mutate(
-    proportion = count / sum(count),
-    label = paste0(round(proportion * 100, 1), "%")
-  ) %>%
-  ggplot(aes(x = "", y = proportion, fill = factor(smoking_dummy))) +
-  geom_bar(stat = "identity", width = 1) +
-  coord_polar("y") +
-  labs(
-    title = "Proportion of Smokers",
-    fill = "Smoking Status (1 = Smoker, 0 = Non-Smoker)"
-  ) +
-  theme_minimal() +
-  geom_text(aes(label = label), position = position_stack(vjust = 0.5))
+# Step 3: Remove Remaining Invalid or Negative Values
+main <- main %>%
+  mutate(nb_of_cigarettes = if_else(nb_of_cigarettes < 0, NA_real_, nb_of_cigarettes)) %>%
+  filter(!is.na(nb_of_cigarettes))
+
+
+# Step 4: Track Missing Categories After Imputation
+missing_breakdown_after <- main %>%
+  summarise(
+    ple0081_h_NA = sum(is.na(ple0081_h)),
+    ple0086_v4_NA = sum(is.na(ple0086_v4))
+  )
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 5: Descriptive Statistics
+# Smoking Dummy
+smoking_stats_all <- main %>%
+  summarise(
+    Mean_Smoking = mean(smoking_dummy, na.rm = TRUE),
+    Count = n()
+  )
+
+smoking_stats_imputed <- main %>%
+  filter(smoking_imputed == 1) %>%
+  summarise(
+    Mean_Smoking = mean(smoking_dummy, na.rm = TRUE),
+    Count = n()
+  )
+
+smoking_stats_non_imputed <- main %>%
+  filter(smoking_imputed == 0) %>%
+  summarise(
+    Mean_Smoking = mean(smoking_dummy, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Smoking (All Rows):")
+print(smoking_stats_all)
+
+print("Descriptive Statistics for Smoking (Imputed Rows):")
+print(smoking_stats_imputed)
+
+print("Descriptive Statistics for Smoking (Non-Imputed Rows):")
+print(smoking_stats_non_imputed)
+
+# Number of Cigarettes
+cigarettes_stats_all <- main %>%
+  summarise(
+    Mean_Cigarettes = mean(nb_of_cigarettes, na.rm = TRUE),
+    Median = median(nb_of_cigarettes, na.rm = TRUE),
+    Q1 = quantile(nb_of_cigarettes, 0.25, na.rm = TRUE),
+    Q3 = quantile(nb_of_cigarettes, 0.75, na.rm = TRUE),
+    Min = min(nb_of_cigarettes, na.rm = TRUE),
+    Max = max(nb_of_cigarettes, na.rm = TRUE),
+    Count = n()
+  )
+
+cigarettes_stats_imputed <- main %>%
+  filter(cigarettes_imputed == 1) %>%
+  summarise(
+    Mean_Cigarettes = mean(nb_of_cigarettes, na.rm = TRUE),
+    Median = median(nb_of_cigarettes, na.rm = TRUE),
+    Q1 = quantile(nb_of_cigarettes, 0.25, na.rm = TRUE),
+    Q3 = quantile(nb_of_cigarettes, 0.75, na.rm = TRUE),
+    Min = min(nb_of_cigarettes, na.rm = TRUE),
+    Max = max(nb_of_cigarettes, na.rm = TRUE),
+    Count = n()
+  )
+
+cigarettes_stats_non_imputed <- main %>%
+  filter(cigarettes_imputed == 0) %>%
+  summarise(
+    Mean_Cigarettes = mean(nb_of_cigarettes, na.rm = TRUE),
+    Median = median(nb_of_cigarettes, na.rm = TRUE),
+    Q1 = quantile(nb_of_cigarettes, 0.25, na.rm = TRUE),
+    Q3 = quantile(nb_of_cigarettes, 0.75, na.rm = TRUE),
+    Min = min(nb_of_cigarettes, na.rm = TRUE),
+    Max = max(nb_of_cigarettes, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Number of Cigarettes (All Rows):")
+print(cigarettes_stats_all)
+
+print("Descriptive Statistics for Number of Cigarettes (Imputed Rows):")
+print(cigarettes_stats_imputed)
+
+print("Descriptive Statistics for Number of Cigarettes (Non-Imputed Rows):")
+print(cigarettes_stats_non_imputed)
+
+# Step 6: Visualizations
+# Smoking Dummy
+ggplot(main, aes(x = factor(smoking_dummy))) +
+  geom_bar(fill = "skyblue", color = "black") +
+  labs(title = "Smoking Status - All Rows", x = "Smoking Status (1 = Yes, 0 = No)", y = "Count") +
+  theme_minimal()
+
+ggplot(main %>% filter(smoking_imputed == 1), aes(x = factor(smoking_dummy))) +
+  geom_bar(fill = "orange", color = "black") +
+  labs(title = "Smoking Status - Imputed Rows", x = "Smoking Status (1 = Yes, 0 = No)", y = "Count") +
+  theme_minimal()
+
+ggplot(main %>% filter(smoking_imputed == 0), aes(x = factor(smoking_dummy))) +
+  geom_bar(fill = "green", color = "black") +
+  labs(title = "Smoking Status - Non-Imputed Rows", x = "Smoking Status (1 = Yes, 0 = No)", y = "Count") +
+  theme_minimal()
+
+# Number of Cigarettes
+ggplot(main, aes(x = nb_of_cigarettes)) +
+  geom_histogram(binwidth = 1, fill = "purple", color = "black") +
+  labs(title = "Number of Cigarettes - All Rows", x = "Cigarettes Per Day", y = "Count") +
+  theme_minimal()
+
+ggplot(main %>% filter(cigarettes_imputed == 1), aes(x = nb_of_cigarettes)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black") +
+  labs(title = "Number of Cigarettes - Imputed Rows", x = "Cigarettes Per Day", y = "Count") +
+  theme_minimal()
+
+ggplot(main %>% filter(cigarettes_imputed == 0), aes(x = nb_of_cigarettes)) +
+  geom_histogram(binwidth = 1, fill = "green", color = "black") +
+  labs(title = "Number of Cigarettes - Non-Imputed Rows", x = "Cigarettes Per Day", y = "Count") +
+  theme_minimal()
 ```
 
-## 3.2.4 Diet: Special Potential Specification
+## 3.2.4 Diet: Special Potential Specification because surveyed every second year from 2004-2014
 ```{r}
 # Create diet_healthy and diet_dummy
 main <- main %>%
@@ -714,251 +1218,278 @@ ggplot(main, aes(x = diet_categorical)) +
   theme_minimal()
 ```
 
+
 # 4. Control Variables
 ## 4.1 Worries about job security, financial situation, and economic situation 
 ```{r}
 # Create variables for worries about job security, financial situation, and economic situation
+# Step 1: Track Missing Categories Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    plh0042_NA = sum(is.na(plh0042)),
+    plh0042_invalid = sum(plh0042 %in% c(-5, -8), na.rm = TRUE),
+    plh0033_NA = sum(is.na(plh0033)),
+    plh0033_invalid = sum(plh0033 %in% c(-5, -8), na.rm = TRUE),
+    plh0032_NA = sum(is.na(plh0032)),
+    plh0032_invalid = sum(plh0032 %in% c(-5, -8), na.rm = TRUE)
+  )
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Lag/Lead Imputation (Max 2 Years)
 main <- main %>%
   arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
   group_by(pid) %>%
   mutate(
-    # Impute -5 or -8 for `plh0042` using dynamic lag and lead
-    plh0042 = ifelse(plh0042 %in% c(-5, -8), NA_real_, plh0042),
-    plh0042 = {
-      temp <- plh0042
-      for (i in seq_len(n())) {
-        if (is.na(temp[i])) {
-          # Check lag and lead values iteratively
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
-          
-          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            # Choose the closest valid value
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
-          } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
-          } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
-          }
-        }
-      }
-      temp
-    },
-    
-    # Repeat for `plh0033`
-    plh0033 = ifelse(plh0033 %in% c(-5, -8), NA_real_, plh0033),
-    plh0033 = {
-      temp <- plh0033
-      for (i in seq_len(n())) {
-        if (is.na(temp[i])) {
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
-          
-          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
-          } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
-          } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
-          }
-        }
-      }
-      temp
-    },
-    
-    # Repeat for `plh0032`
-    plh0032 = ifelse(plh0032 %in% c(-5, -8), NA_real_, plh0032),
-    plh0032 = {
-      temp <- plh0032
-      for (i in seq_len(n())) {
-        if (is.na(temp[i])) {
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
-          
-          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
-          } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
-          } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
-          }
-        }
-      }
-      temp
-    }
-  ) %>%
-  ungroup() %>%
-  mutate(
-    # Transformations for `worr_job_categorical`
-    worr_job_categorical = case_when(
-      plh0042 == -2 ~ 3,
-      plh0042 < 0 ~ NA_real_,
+    # Impute -5 or -8 for `plh0042` with max 2-year lag/lead
+    worries_job_imputed = if_else(plh0042 %in% c(-5, -8), 1, 0),
+    plh0042 = case_when(
+      plh0042 %in% c(-5, -8) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(plh0042), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(plh0042), NA_real_)
+        if_else(!is.na(lag_val) & !is.na(lead_val), (lag_val + lead_val) / 2, coalesce(lag_val, lead_val))
+      },
       TRUE ~ plh0042
     ),
-    # Transformations for `worr_financial_categorical`
-    worr_financial_categorical = case_when(
-      plh0033 == -2 ~ 3,
-      plh0033 < 0 ~ NA_real_,
+
+    # Repeat for `plh0033`
+    worries_financial_imputed = if_else(plh0033 %in% c(-5, -8), 1, 0),
+    plh0033 = case_when(
+      plh0033 %in% c(-5, -8) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(plh0033), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(plh0033), NA_real_)
+        if_else(!is.na(lag_val) & !is.na(lead_val), (lag_val + lead_val) / 2, coalesce(lag_val, lead_val))
+      },
       TRUE ~ plh0033
     ),
-    # Transformations for `worr_economic_categorical`
-    worr_economic_categorical = case_when(
-      plh0032 == -2 ~ 3,
-      plh0032 < 0 ~ NA_real_,
+
+    # Repeat for `plh0032`
+    worries_economic_imputed = if_else(plh0032 %in% c(-5, -8), 1, 0),
+    plh0032 = case_when(
+      plh0032 %in% c(-5, -8) ~ {
+        lag_val <- if_else(syear - lag(syear) <= 2, lag(plh0032), NA_real_)
+        lead_val <- if_else(lead(syear) - syear <= 2, lead(plh0032), NA_real_)
+        if_else(!is.na(lag_val) & !is.na(lead_val), (lag_val + lead_val) / 2, coalesce(lag_val, lead_val))
+      },
       TRUE ~ plh0032
     )
   ) %>%
-  drop_na(worr_job_categorical, worr_financial_categorical, worr_economic_categorical) %>%
+  ungroup() 
+
+# Step 3: Create Categorical and Dummy Variables
+main <- main %>%
   mutate(
-    worr_job_categorical = factor(
-      worr_job_categorical,
-      levels = c(3, 2, 1),
-      labels = c("no worries", "worries a little", "worries a lot")
-    ),
-    worr_financial_categorical = factor(
-      worr_financial_categorical,
-      levels = c(3, 2, 1),
-      labels = c("no worries", "worries a little", "worries a lot")
-    ),
-    worr_economic_categorical = factor(
-      worr_economic_categorical,
-      levels = c(3, 2, 1),
-      labels = c("no worries", "worries a little", "worries a lot")
-    ),
+    worr_job_categorical = factor(case_when(plh0042 == -2 ~ 3, TRUE ~ plh0042),
+                                  levels = c(3, 2, 1), labels = c("no worries", "worries a little", "worries a lot")),
+    worr_financial_categorical = factor(case_when(plh0033 == -2 ~ 3, TRUE ~ plh0033),
+                                        levels = c(3, 2, 1), labels = c("no worries", "worries a little", "worries a lot")),
+    worr_economic_categorical = factor(case_when(plh0032 == -2 ~ 3, TRUE ~ plh0032),
+                                       levels = c(3, 2, 1), labels = c("no worries", "worries a little", "worries a lot")),
     worr_job_dummy = ifelse(worr_job_categorical %in% c("worries a lot", "worries a little"), 1, 0),
     worr_financial_dummy = ifelse(worr_financial_categorical %in% c("worries a lot", "worries a little"), 1, 0),
     worr_economic_dummy = ifelse(worr_economic_categorical %in% c("worries a lot", "worries a little"), 1, 0)
-  ) %>%
-  select(-plh0042, -plh0033, -plh0032)
+  )
 
-#Visualisation: Bar Plots
+
+```
+# Continuation of code
+```{r}
+# Define descriptive_stats function
+descriptive_stats <- function(data, condition) {
+  data %>%
+    filter(!!rlang::enquo(condition)) %>%  # Use enquo for capturing condition
+    summarise(
+      Job_Worries_Mean = mean(as.numeric(worr_job_dummy), na.rm = TRUE),
+      Financial_Worries_Mean = mean(as.numeric(worr_financial_dummy), na.rm = TRUE),
+      Economic_Worries_Mean = mean(as.numeric(worr_economic_dummy), na.rm = TRUE),
+      Count = n()
+    )
+}
+# Calculate statistics for all rows, imputed rows, and non-imputed rows
+all_stats <- descriptive_stats(main, TRUE)
+imputed_stats <- descriptive_stats(main, worries_job_imputed == 1 | worries_financial_imputed == 1 | worries_economic_imputed == 1)
+non_imputed_stats <- descriptive_stats(main, worries_job_imputed == 0 & worries_financial_imputed == 0 & worries_economic_imputed == 0)
+
+print("Descriptive Statistics for All Rows:")
+print(all_stats)
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Visualizations
+# Drop rows with NAs in worry-related columns
+main <- main %>%
+  drop_na(worr_job_categorical, worr_financial_categorical, worr_economic_categorical)
+
+# Distribution of Worry Levels - All Rows
 main %>%
   select(worr_job_categorical, worr_financial_categorical, worr_economic_categorical) %>%
   pivot_longer(cols = everything(), names_to = "Worry_Type", values_to = "Worry_Level") %>%
   ggplot(aes(x = Worry_Level, fill = Worry_Type)) +
   geom_bar(position = "dodge", color = "black") +
   labs(
-    title = "Distribution of Worries About Job Security, Financial, and Economic Situation",
+    title = "Distribution of Worry Levels - All Rows",
     x = "Worry Level",
     y = "Count",
     fill = "Worry Type"
   ) +
   theme_minimal()
+
+# Imputed Rows
+main %>%
+  filter(worries_job_imputed == 1 | worries_financial_imputed == 1 | worries_economic_imputed == 1) %>%
+  pivot_longer(cols = c(worr_job_categorical, worr_financial_categorical, worr_economic_categorical), 
+               names_to = "Worry_Type", values_to = "Worry_Level") %>%
+  ggplot(aes(x = Worry_Level, fill = Worry_Type)) +
+  geom_bar(position = "dodge", color = "black") +
+  labs(
+    title = "Distribution of Worry Levels - Imputed Rows",
+    x = "Worry Level",
+    y = "Count",
+    fill = "Worry Type"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows
+main %>%
+  filter(worries_job_imputed == 0 & worries_financial_imputed == 0 & worries_economic_imputed == 0) %>%
+  pivot_longer(cols = c(worr_job_categorical, worr_financial_categorical, worr_economic_categorical), 
+               names_to = "Worry_Type", values_to = "Worry_Level") %>%
+  ggplot(aes(x = Worry_Level, fill = Worry_Type)) +
+  geom_bar(position = "dodge", color = "black") +
+  labs(
+    title = "Distribution of Worry Levels - Non-Imputed Rows",
+    x = "Worry Level",
+    y = "Count",
+    fill = "Worry Type"
+  ) +
+  theme_minimal()
+
 ```
 
 ## 4.2 Tenure and Employment Status
 ```{r}
-# Transform tenure (pgerwzeit) and employment status (pgemplst)
+# Step 1: Breakdown Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    NA_count = sum(is.na(pgerwzeit)),
+    not_asked = sum(pgerwzeit %in% c(-8, -5), na.rm = TRUE),
+    other_neg = sum(pgerwzeit < 0 & !(pgerwzeit %in% c(-8, -5)), na.rm = TRUE)
+  )
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Tenure with Year Difference Logic and Max 2-Year Lag/Lead
 main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(
-    # Impute -5 or -8 for `pgerwzeit` using dynamic lag and lead
     tenure = ifelse(pgerwzeit %in% c(-5, -8), NA_real_, pgerwzeit),
     tenure = {
       temp <- tenure
+      years <- syear
       for (i in seq_len(n())) {
         if (is.na(temp[i])) {
-          # Check lag and lead values iteratively
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
+          lag_idx <- which(!is.na(temp) & years < years[i] & (years[i] - years <= 2))
+          lead_idx <- which(!is.na(temp) & years > years[i] & (years - years[i] <= 2))
           
           if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            # Choose the closest valid value
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            lead_diff <- years[lead_idx[1]] - years[i]
+            nearest <- ifelse(lag_diff <= lead_diff, lag_idx[length(lag_idx)], lead_idx[1])
+            temp[i] <- temp[nearest] + ifelse(nearest %in% lag_idx, lag_diff, -lead_diff)
           } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            temp[i] <- temp[lag_idx[length(lag_idx)]] + lag_diff
           } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
+            lead_diff <- years[lead_idx[1]] - years[i]
+            temp[i] <- temp[lead_idx[1]] - lead_diff
           }
         }
       }
       temp
     },
-    # Set `-2` to 0
     tenure = ifelse(is.na(tenure) & pgerwzeit == -2, 0, tenure)
   ) %>%
-  ungroup() %>%  # Ungroup after grouped operations
+  ungroup() %>%
   mutate(
-    tenure = ifelse(tenure < 0, NA_real_, tenure)  # Ensure no negative tenure remains
-  ) %>%  
-  mutate(
-    employment_status_categorical = case_when(
-      pgemplst == -2 ~ 5,
-      pgemplst == 1 ~ 1,
-      pgemplst == 2 ~ 2,
-      pgemplst == 3 ~ 3,
-      pgemplst == 4 ~ 4,
-      pgemplst == 5 ~ 5,
-      pgemplst == 6 ~ 6,
-      TRUE ~ NA_real_
-    ),
-    employed_dummy = ifelse(employment_status_categorical %in% c(1, 2), 1, 0)
-  ) %>%
-  drop_na(employment_status_categorical) %>%  # Remove rows with invalid values
-  drop_na(tenure) %>%  # Remove rows with NA values in tenure
-  mutate(
-    employment_status_categorical = factor(
-      employment_status_categorical,
-      levels = 1:6,
-      labels = c(
-        "Full-time", 
-        "Part-time", 
-        "Vocational training", 
-        "Irregular part-time", 
-        "Unemployed", 
-        "Sheltered workshop"
-      )
-    )
-  ) %>%
-  select(-pgemplst)  # Drop the original `pgemplst` column
+    tenure = ifelse(tenure < 0, NA_real_, tenure),  # Remove any remaining negatives
+    imputed_flag = if_else(is.na(pgerwzeit) | pgerwzeit %in% c(-8, -5), 1, 0)  # Track imputed rows
+  )
 
-#Visualisation: Bar Plots
-ggplot(main, aes(x = employment_status_categorical)) +
-  geom_bar(fill = "steelblue", color = "black") +
+# Step 3: Breakdown After Imputation
+missing_breakdown_after <- main %>%
+  summarise(
+    NA_count_after = sum(is.na(tenure)),
+    imputed_count = sum(imputed_flag)
+  )
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 4: Descriptive Statistics for Imputed and Non-Imputed Rows
+# Imputed Rows
+imputed_stats <- main %>%
+  filter(imputed_flag == 1) %>%
+  summarise(
+    Mean_Tenure = mean(tenure, na.rm = TRUE),
+    Median_Tenure = median(tenure, na.rm = TRUE),
+    Q1 = quantile(tenure, 0.25, na.rm = TRUE),
+    Q3 = quantile(tenure, 0.75, na.rm = TRUE),
+    Min = min(tenure, na.rm = TRUE),
+    Max = max(tenure, na.rm = TRUE),
+    Count = n()
+  )
+
+# Non-Imputed Rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag == 0) %>%
+  summarise(
+    Mean_Tenure = mean(tenure, na.rm = TRUE),
+    Median_Tenure = median(tenure, na.rm = TRUE),
+    Q1 = quantile(tenure, 0.25, na.rm = TRUE),
+    Q3 = quantile(tenure, 0.75, na.rm = TRUE),
+    Min = min(tenure, na.rm = TRUE),
+    Max = max(tenure, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Visualizations
+# All Rows
+ggplot(main, aes(x = tenure)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
   labs(
-    title = "Distribution of Employment Status",
-    x = "Employment Status",
+    title = "Distribution of Tenure - All Rows",
+    x = "Tenure (Years)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 1), aes(x = tenure)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black") +
+  labs(
+    title = "Distribution of Tenure - Imputed Rows",
+    x = "Tenure (Years)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 0), aes(x = tenure)) +
+  geom_histogram(binwidth = 1, fill = "green", color = "black") +
+  labs(
+    title = "Distribution of Tenure - Non-Imputed Rows",
+    x = "Tenure (Years)",
     y = "Count"
   ) +
   theme_minimal()
@@ -968,176 +1499,372 @@ ggplot(main, aes(x = employment_status_categorical)) +
 ## 4.3 Net Income and Working time per week
 ```{r}
 # Transform `pglabnet` into `net_income`
-# Handle `net_income` transformation
+# Transform `pglabnet` into `net_income`
 main <- main %>%
   arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
   group_by(pid) %>%
   mutate(
-    net_income = ifelse(pglabnet %in% c(-5, -8), NA_real_, pglabnet),  # Replace -5 and -8 with NA
-    # Iterative imputation using lag and lead
+    # Replace invalid values with NA
+    net_income = ifelse(pglabnet %in% c(-5, -8, 99999), NA_real_, pglabnet),
+    # Iterative imputation using lag and lead with a max 2-year difference
     net_income = {
       temp <- net_income
+      years <- syear
       for (i in seq_len(n())) {
         if (is.na(temp[i])) {
-          # Check lag and lead values iteratively
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
+          # Find valid lag and lead indices within a 2-year difference
+          lag_idx <- which(!is.na(temp) & years < years[i] & (years[i] - years <= 2))
+          lead_idx <- which(!is.na(temp) & years > years[i] & (years - years[i] <= 2))
           
           if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            # Choose the closest valid value
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            lead_diff <- years[lead_idx[1]] - years[i]
+            nearest <- ifelse(lag_diff <= lead_diff, lag_idx[length(lag_idx)], lead_idx[1])
+            temp_value <- temp[nearest]
+            temp[i] <- ifelse(temp_value < 0, NA_real_, temp_value)  # Set NA if negative
           } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
+            temp_value <- temp[lag_idx[length(lag_idx)]]
+            temp[i] <- ifelse(temp_value < 0, NA_real_, temp_value)  # Set NA if negative
           } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
+            temp_value <- temp[lead_idx[1]]
+            temp[i] <- ifelse(temp_value < 0, NA_real_, temp_value)  # Set NA if negative
           }
         }
       }
       temp
     },
-    # Additional rules for specific values
-    net_income = case_when(
-      net_income == 99999 ~ NA_real_,  # Treat `99999` as missing
-      net_income == -2 ~ 0,  # Set `-2` to 0
-      TRUE ~ net_income  # Keep valid values
-    )
+    # Set -2 to NA
+    net_income = ifelse(net_income < 0, NA_real_, net_income)  # Ensure no negative values
   ) %>%
   ungroup() %>%
-  drop_na(net_income) %>%  # Remove rows where imputation still results in NA
-  select(-pglabnet)  # Drop the original `pglabnet` column
+  mutate(
+    # Remove remaining NA values in ALL rows
+    net_income = ifelse(is.na(net_income), NA_real_, net_income),
+    imputed_flag_net_income = ifelse(is.na(pglabnet) | pglabnet %in% c(-5, -8, 99999), 1, 0)
+  ) %>%
+  filter(!is.na(net_income))  # Remove rows with NA net_income
 
+# Transform `pgtatzeit` into `work_time_weekly`
 main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(
-    work_time_weekly = ifelse(pgtatzeit %in% c(-5, -8), NA_real_, pgtatzeit),  # Replace -5 and -8 with NA
-    # Iterative imputation using lag and lead
+    # Replace invalid values with NA
+    work_time_weekly = ifelse(pgtatzeit %in% c(-5, -8), NA_real_, pgtatzeit),
+    # Iterative imputation using lag and lead with a max 2-year difference
     work_time_weekly = {
       temp <- work_time_weekly
+      years <- syear
       for (i in seq_len(n())) {
         if (is.na(temp[i])) {
-          # Check lag and lead values iteratively
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
+          # Find valid lag and lead indices within a 2-year difference
+          lag_idx <- which(!is.na(temp) & years < years[i] & (years[i] - years <= 2))
+          lead_idx <- which(!is.na(temp) & years > years[i] & (years - years[i] <= 2))
           
           if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            # Choose the closest valid value
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            lead_diff <- years[lead_idx[1]] - years[i]
+            nearest <- ifelse(lag_diff <= lead_diff, lag_idx[length(lag_idx)], lead_idx[1])
+            temp_value <- temp[nearest]
+            temp[i] <- ifelse(temp_value < 0, NA_real_, temp_value)  # Set NA if negative
           } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
+            temp_value <- temp[lag_idx[length(lag_idx)]]
+            temp[i] <- ifelse(temp_value < 0, NA_real_, temp_value)  # Set NA if negative
           } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            temp[i] <- temp[nearest]
+            temp_value <- temp[lead_idx[1]]
+            temp[i] <- ifelse(temp_value < 0, NA_real_, temp_value)  # Set NA if negative
           }
         }
       }
       temp
     },
-    # Additional rules for specific values
-    work_time_weekly = case_when(
-      work_time_weekly == -2 ~ 0,  # Set `-2` to 0
-      work_time_weekly >= 0 ~ work_time_weekly,  # Keep valid non-negative values
-      TRUE ~ NA_real_  # Set all other cases to NA
-    )
+    # Set negative values to NA
+    work_time_weekly = ifelse(work_time_weekly < 0, NA_real_, work_time_weekly)
   ) %>%
   ungroup() %>%
-  drop_na(work_time_weekly) %>%  # Remove rows where imputation still results in NA
-  select(-pgtatzeit)  # Drop the original `pgtatzeit` column
-#Visualisation: Histogram- Net Income
+  mutate(
+    # Remove remaining NA values in ALL rows
+    work_time_weekly = ifelse(is.na(work_time_weekly), NA_real_, work_time_weekly),
+    imputed_flag_work_time = ifelse(is.na(pgtatzeit) | pgtatzeit %in% c(-5, -8), 1, 0)
+  ) %>%
+  filter(!is.na(work_time_weekly))  # Remove rows with NA work_time_weekly
+
+# Summary Statistics for Net Income
+# All rows
+net_income_all <- main %>%
+  summarise(
+    Mean = mean(net_income, na.rm = TRUE),
+    Median = median(net_income, na.rm = TRUE),
+    Min = min(net_income, na.rm = TRUE),
+    Max = max(net_income, na.rm = TRUE),
+    Count = sum(!is.na(net_income))
+  )
+
+# Imputed rows
+net_income_imputed <- main %>%
+  filter(imputed_flag_net_income == 1) %>%
+  summarise(
+    Mean = mean(net_income, na.rm = TRUE),
+    Median = median(net_income, na.rm = TRUE),
+    Min = min(net_income, na.rm = TRUE),
+    Max = max(net_income, na.rm = TRUE),
+    Count = sum(!is.na(net_income))
+  )
+
+# Non-imputed rows
+net_income_non_imputed <- main %>%
+  filter(imputed_flag_net_income == 0) %>%
+  summarise(
+    Mean = mean(net_income, na.rm = TRUE),
+    Median = median(net_income, na.rm = TRUE),
+    Min = min(net_income, na.rm = TRUE),
+    Max = max(net_income, na.rm = TRUE),
+    Count = sum(!is.na(net_income))
+  )
+
+# Summary Statistics for Work Time Weekly
+# All rows
+work_time_all <- main %>%
+  summarise(
+    Mean = mean(work_time_weekly, na.rm = TRUE),
+    Median = median(work_time_weekly, na.rm = TRUE),
+    Min = min(work_time_weekly, na.rm = TRUE),
+    Max = max(work_time_weekly, na.rm = TRUE),
+    Count = sum(!is.na(work_time_weekly))
+  )
+
+# Imputed rows
+work_time_imputed <- main %>%
+  filter(imputed_flag_work_time == 1) %>%
+  summarise(
+    Mean = mean(work_time_weekly, na.rm = TRUE),
+    Median = median(work_time_weekly, na.rm = TRUE),
+    Min = min(work_time_weekly, na.rm = TRUE),
+    Max = max(work_time_weekly, na.rm = TRUE),
+    Count = sum(!is.na(work_time_weekly))
+  )
+
+# Non-imputed rows
+work_time_non_imputed <- main %>%
+  filter(imputed_flag_work_time == 0) %>%
+  summarise(
+    Mean = mean(work_time_weekly, na.rm = TRUE),
+    Median = median(work_time_weekly, na.rm = TRUE),
+    Min = min(work_time_weekly, na.rm = TRUE),
+    Max = max(work_time_weekly, na.rm = TRUE),
+    Count = sum(!is.na(work_time_weekly))
+  )
+
+# Display Results
+print("Net Income Summary Statistics - All Rows:")
+print(net_income_all)
+
+print("Net Income Summary Statistics - Imputed Rows:")
+print(net_income_imputed)
+
+print("Net Income Summary Statistics - Non-Imputed Rows:")
+print(net_income_non_imputed)
+
+print("\nWork Time Weekly Summary Statistics - All Rows:")
+print(work_time_all)
+
+print("Work Time Weekly Summary Statistics - Imputed Rows:")
+print(work_time_imputed)
+
+print("Work Time Weekly Summary Statistics - Non-Imputed Rows:")
+print(work_time_non_imputed)
+
+
+# Plot for Net Income - All Rows
 ggplot(main, aes(x = net_income)) +
-  geom_histogram(binwidth = 500, fill = "darkgreen", color = "black") +
+  geom_histogram(binwidth = 500, fill = "skyblue", color = "black", alpha = 0.7) +
   labs(
-    title = "Distribution of Net Income",
+    title = "Net Income Distribution - All Rows",
     x = "Net Income",
-    y = "Count"
+    y = "Frequency"
   ) +
-  theme_minimal()
-#Visualisation: Histogram- Work Time Weekly
-ggplot(main, aes(x = work_time_weekly)) +
-  geom_histogram(binwidth = 5, fill = "orange", color = "black") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot for Net Income - Imputed Rows
+ggplot(main %>% filter(imputed_flag_net_income == 1), aes(x = net_income)) +
+  geom_histogram(binwidth = 500, fill = "orange", color = "black", alpha = 0.7) +
   labs(
-    title = "Distribution of Work Time Weekly",
-    x = "Work Time (Hours/Week)",
-    y = "Count"
+    title = "Net Income Distribution - Imputed Rows",
+    x = "Net Income",
+    y = "Frequency"
   ) +
-  theme_minimal()
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot for Net Income - Non-Imputed Rows
+ggplot(main %>% filter(imputed_flag_net_income == 0), aes(x = net_income)) +
+  geom_histogram(binwidth = 500, fill = "green", color = "black", alpha = 0.7) +
+  labs(
+    title = "Net Income Distribution - Non-Imputed Rows",
+    x = "Net Income",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot for Work Time Weekly - All Rows
+ggplot(main, aes(x = work_time_weekly)) +
+  geom_histogram(binwidth = 5, fill = "lightcoral", color = "black", alpha = 0.7) +
+  labs(
+    title = "Work Time Weekly Distribution - All Rows",
+    x = "Work Time (Hours/Week)",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot for Work Time Weekly - Imputed Rows
+ggplot(main %>% filter(imputed_flag_work_time == 1), aes(x = work_time_weekly)) +
+  geom_histogram(binwidth = 5, fill = "gold", color = "black", alpha = 0.7) +
+  labs(
+    title = "Work Time Weekly Distribution - Imputed Rows",
+    x = "Work Time (Hours/Week)",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot for Work Time Weekly - Non-Imputed Rows
+ggplot(main %>% filter(imputed_flag_work_time == 0), aes(x = work_time_weekly)) +
+  geom_histogram(binwidth = 5, fill = "blue", color = "black", alpha = 0.7) +
+  labs(
+    title = "Work Time Weekly Distribution - Non-Imputed Rows",
+    x = "Work Time (Hours/Week)",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
 
 ```
 
 ## 4.4 Unemployment
 ```{r}
 # Transform total years unemployed (pgexpue)
+# Step 1: Breakdown Before Imputation
+missing_breakdown_before <- main %>%
+  summarise(
+    NA_count = sum(is.na(pgexpue)),
+    not_asked = sum(pgexpue %in% c(-8, -5), na.rm = TRUE),
+    other_neg = sum(pgexpue < 0 & !(pgexpue %in% c(-8, -5)), na.rm = TRUE)
+  )
+
+print("Breakdown of missing values before imputation:")
+print(missing_breakdown_before)
+
+# Step 2: Impute Total Years Unemployment with Year Difference Logic and Max 2-Year Lag/Lead
 main <- main %>%
-  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  arrange(pid, syear) %>%
   group_by(pid) %>%
   mutate(
-    # Replace -5 and -8 with NA for imputation
     total_years_unemployment = ifelse(pgexpue %in% c(-5, -8), NA_real_, pgexpue),
-    # Iterative imputation with adjustment for year differences
     total_years_unemployment = {
       temp <- total_years_unemployment
+      years <- syear
       for (i in seq_len(n())) {
         if (is.na(temp[i])) {
-          # Find the nearest valid value in lag or lead
-          lag_idx <- which(!is.na(temp) & row_number() < i)
-          lead_idx <- which(!is.na(temp) & row_number() > i)
+          lag_idx <- which(!is.na(temp) & years < years[i] & (years[i] - years <= 2))
+          lead_idx <- which(!is.na(temp) & years > years[i] & (years - years[i] <= 2))
           
           if (length(lag_idx) > 0 && length(lead_idx) > 0) {
-            # Choose the closer value between lag and lead
-            nearest <- ifelse(
-              (i - lag_idx[length(lag_idx)]) <= (lead_idx[1] - i),
-              lag_idx[length(lag_idx)],
-              lead_idx[1]
-            )
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            lead_diff <- years[lead_idx[1]] - years[i]
+            nearest <- ifelse(lag_diff <= lead_diff, lag_idx[length(lag_idx)], lead_idx[1])
+            temp[i] <- temp[nearest] - abs(years[i] - years[nearest])  # Adjust for year difference
           } else if (length(lag_idx) > 0) {
-            nearest <- lag_idx[length(lag_idx)]
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            temp[i] <- temp[lag_idx[length(lag_idx)]] - lag_diff
           } else if (length(lead_idx) > 0) {
-            nearest <- lead_idx[1]
-          } else {
-            nearest <- NA
-          }
-          
-          if (!is.na(nearest)) {
-            # Adjust for the difference in years
-            year_diff <- syear[i] - syear[nearest]
-            temp[i] <- temp[nearest] - year_diff
+            lead_diff <- years[lead_idx[1]] - years[i]
+            temp[i] <- temp[lead_idx[1]] - lead_diff
           }
         }
       }
       temp
     },
-    # Transform -2 into 0 after imputation
-    total_years_unemployment = ifelse(total_years_unemployment == -2, 0, total_years_unemployment)
+    total_years_unemployment = ifelse(is.na(total_years_unemployment) & pgexpue == -2, 0, total_years_unemployment)
   ) %>%
   ungroup() %>%
-  # Drop rows where the value remains NA after imputation
-  drop_na(total_years_unemployment) %>%
-  # Remove the original `pgexpue` column
-  select(-pgexpue)
-#Visualisation: Bar Plot
+  mutate(
+    total_years_unemployment = ifelse(total_years_unemployment < 0, NA_real_, total_years_unemployment),  # Remove negatives
+    imputed_flag = if_else(is.na(pgexpue) | pgexpue %in% c(-8, -5), 1, 0)  # Track imputed rows
+  )
+
+# Step 3: Breakdown After Imputation
+missing_breakdown_after <- main %>%
+  summarise(
+    NA_count_after = sum(is.na(total_years_unemployment)),
+    imputed_count = sum(imputed_flag)
+  )
+
+print("Breakdown of missing values after imputation:")
+print(missing_breakdown_after)
+
+# Step 4: Descriptive Statistics for Imputed and Non-Imputed Rows
+# Imputed Rows
+imputed_stats <- main %>%
+  filter(imputed_flag == 1) %>%
+  summarise(
+    Mean_Years_Unemployed = mean(total_years_unemployment, na.rm = TRUE),
+    Median_Years_Unemployed = median(total_years_unemployment, na.rm = TRUE),
+    Q1 = quantile(total_years_unemployment, 0.25, na.rm = TRUE),
+    Q3 = quantile(total_years_unemployment, 0.75, na.rm = TRUE),
+    Min = min(total_years_unemployment, na.rm = TRUE),
+    Max = max(total_years_unemployment, na.rm = TRUE),
+    Count = n()
+  )
+
+# Non-Imputed Rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag == 0) %>%
+  summarise(
+    Mean_Years_Unemployed = mean(total_years_unemployment, na.rm = TRUE),
+    Median_Years_Unemployed = median(total_years_unemployment, na.rm = TRUE),
+    Q1 = quantile(total_years_unemployment, 0.25, na.rm = TRUE),
+    Q3 = quantile(total_years_unemployment, 0.75, na.rm = TRUE),
+    Min = min(total_years_unemployment, na.rm = TRUE),
+    Max = max(total_years_unemployment, na.rm = TRUE),
+    Count = n()
+  )
+
+print("Descriptive Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Descriptive Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Step 5: Visualizations
+# All Rows
 ggplot(main, aes(x = total_years_unemployment)) +
-  geom_bar(fill = "purple", color = "black") +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
   labs(
-    title = "Distribution of Total Years Unemployed",
+    title = "Distribution of Total Years Unemployed - All Rows",
+    x = "Total Years Unemployed",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 1), aes(x = total_years_unemployment)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black") +
+  labs(
+    title = "Distribution of Total Years Unemployed - Imputed Rows",
+    x = "Total Years Unemployed",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 0), aes(x = total_years_unemployment)) +
+  geom_histogram(binwidth = 1, fill = "green", color = "black") +
+  labs(
+    title = "Distribution of Total Years Unemployed - Non-Imputed Rows",
     x = "Total Years Unemployed",
     y = "Count"
   ) +
@@ -1260,27 +1987,124 @@ ggplot(main, aes(x = migback)) +
 
 ## 4.8 Marital Status
 ```{r}
+# Count the number of NA rows before imputation
+na_count_before <- sum(is.na(main$pgfamstd_dummy))
+print(paste("Number of NA rows in pgfamstd_dummy before imputation:", na_count_before))
+
+# Transform marital status and handle NA with lag/lead logic
 main <- main %>%
+  arrange(pid, syear) %>%  # Ensure data is ordered by pid and syear
+  group_by(pid) %>%
   mutate(
     pgfamstd = case_when(
       pgfamstd < 0 ~ NA_real_,       # Replace negative values with NA
       TRUE ~ pgfamstd                # Keep the original value otherwise
-    )
-  ) %>%
-  mutate(
+    ),
     pgfamstd_dummy = case_when(
       pgfamstd %in% c(1, 6, 7, 8) ~ "married",
       pgfamstd %in% c(2, 3, 4, 5) ~ "single",
-      TRUE ~ NA_character_  ) )      # Handle unexpected missings
-# Visualization: Bar Plot
+      TRUE ~ NA_character_          # Handle unexpected missings
+    ),
+    # Impute NA values using lag and lead logic
+    pgfamstd_dummy = {
+      temp <- pgfamstd_dummy
+      years <- syear
+      for (i in seq_len(n())) {
+        if (is.na(temp[i])) {
+          lag_idx <- which(!is.na(temp) & years < years[i] & (years[i] - years <= 2))
+          lead_idx <- which(!is.na(temp) & years > years[i] & (years - years[i] <= 2))
+          
+          if (length(lag_idx) > 0 && length(lead_idx) > 0) {
+            lag_diff <- years[i] - years[lag_idx[length(lag_idx)]]
+            lead_diff <- years[lead_idx[1]] - years[i]
+            nearest <- ifelse(lag_diff <= lead_diff, lag_idx[length(lag_idx)], lead_idx[1])
+            temp[i] <- temp[nearest]
+          } else if (length(lag_idx) > 0) {
+            temp[i] <- temp[lag_idx[length(lag_idx)]]
+          } else if (length(lead_idx) > 0) {
+            temp[i] <- temp[lead_idx[1]]
+          }
+        }
+      }
+      temp
+    }
+  ) %>%
+  ungroup() %>%
+  mutate(
+    imputed_flag = if_else(is.na(pgfamstd) | pgfamstd < 0, 1, 0)  # Track imputed rows
+  )
+
+# Drop all rows with NA in `pgfamstd_dummy`
+main <- main %>%
+  filter(!is.na(pgfamstd_dummy))
+
+# Summary Statistics
+# All Rows
+all_stats <- main %>%
+  summarise(
+    Married = sum(pgfamstd_dummy == "married", na.rm = TRUE),
+    Single = sum(pgfamstd_dummy == "single", na.rm = TRUE),
+    Total = n()
+  )
+
+# Imputed Rows
+imputed_stats <- main %>%
+  filter(imputed_flag == 1) %>%
+  summarise(
+    Married = sum(pgfamstd_dummy == "married", na.rm = TRUE),
+    Single = sum(pgfamstd_dummy == "single", na.rm = TRUE),
+    Total = n()
+  )
+
+# Non-Imputed Rows
+non_imputed_stats <- main %>%
+  filter(imputed_flag == 0) %>%
+  summarise(
+    Married = sum(pgfamstd_dummy == "married", na.rm = TRUE),
+    Single = sum(pgfamstd_dummy == "single", na.rm = TRUE),
+    Total = n()
+  )
+
+print("Summary Statistics for All Rows:")
+print(all_stats)
+
+print("Summary Statistics for Imputed Rows:")
+print(imputed_stats)
+
+print("Summary Statistics for Non-Imputed Rows:")
+print(non_imputed_stats)
+
+# Visualizations
+# All Rows
 ggplot(main, aes(x = factor(pgfamstd_dummy))) +
-  geom_bar(fill = "lightblue", color = "black") +
+  geom_bar(fill = "skyblue", color = "black") +
   labs(
-    title = "Distribution of Family Status",
+    title = "Distribution of Family Status - All Rows",
     x = "Family Status",
     y = "Count"
   ) +
   theme_minimal()
+
+# Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 1), aes(x = factor(pgfamstd_dummy))) +
+  geom_bar(fill = "orange", color = "black") +
+  labs(
+    title = "Distribution of Family Status - Imputed Rows",
+    x = "Family Status",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Non-Imputed Rows Only
+ggplot(main %>% filter(imputed_flag == 0), aes(x = factor(pgfamstd_dummy))) +
+  geom_bar(fill = "green", color = "black") +
+  labs(
+    title = "Distribution of Family Status - Non-Imputed Rows",
+    x = "Family Status",
+    y = "Count"
+  ) +
+  theme_minimal()
+
 ```
 
 ## 4.8 Born In Germany
@@ -1344,21 +2168,24 @@ ggplot(main, aes(x = age)) +
 
 # Final Cleanup: Keeping relevant variables
 ```{r}
+print(colnames(main))
 # Select only the relevant variables
 main <- main %>%
   select(
-    pid, syear, health, worr_health_categorical, worr_health_dummy, 
+    pid, syear,  # Unique identifiers
+    health, worr_health_categorical, worr_health_dummy, 
     migback, germborn, hospital_stay, smoking_dummy, nb_of_cigarettes, illnesses, 
     impaired_stairs, impaired_tiring_tasks, diet_categorical, diet_dummy, avg_grip, 
     life_satisfaction, health_satisfaction,  
     height, weight, BMI, bmi_categorical, worr_job_categorical, worr_financial_categorical,
     worr_economic_categorical, worr_job_dummy, worr_financial_dummy, worr_economic_dummy, 
-    tenure, employment_status_categorical, employed_dummy, net_income, work_time_weekly,
-    total_years_unemployment, occup_status, male, migback_dummy, age
+    tenure, net_income, work_time_weekly, total_years_unemployment, 
+    occup_status, male, migback_dummy, age
   )
 
+
 #Display the summary of the dataset
-summary(main)
+skim(main)
 ```
 
 # Saving the cleaned dataset
